@@ -23,6 +23,8 @@ Provide you with the simplest possible visual Ollama interface.
 + 🗂️ Model Management: Download and Delete Models.
 + 🎨 UI Enhancement: Bubble dialog theme.
 + 📝 Editable Conversation History.
+### v1.2.2 
++ 💾 Save and Load Conversation History.
 
 ## 📎 Before Start
 

@@ -13,7 +13,7 @@ from typing import Optional, List, Generator
 
 try:
     import tkinter as tk
-    from tkinter import ttk, font, messagebox
+    from tkinter import ttk, font, messagebox, filedialog
 
 except (ModuleNotFoundError, ImportError):
     print(
@@ -21,7 +21,7 @@ except (ModuleNotFoundError, ImportError):
         "Please refer to https://github.com/chyok/ollama-gui?tab=readme-ov-file#-qa")
     sys.exit(0)
 
-__version__ = "1.2.1"
+__version__ = "1.2.2"
 
 
 def _system_check(root: tk.Tk) -> Optional[str]:
@@ -335,6 +335,47 @@ class OllamaInterface:
         self.chat_box.config(state=tk.DISABLED)
         self.chat_history.clear()
 
+    def save_chat(self):
+        filepath = filedialog.asksaveasfilename(
+            defaultextension=".json",
+            filetypes=[("JSON files", "*.json"), ("All files", "*.*")],
+            title="Save Chat As"
+        )
+        if filepath:
+            with open(filepath, 'w', encoding='utf-8') as f:
+                json.dump(self.chat_history, f, indent=2)
+
+    def load_chat(self):
+        filepath = filedialog.askopenfilename(
+            filetypes=[("JSON files", "*.json"), ("All files", "*.*")],
+            title="Load Chat"
+        )
+        if not filepath:
+            return
+        
+        with open(filepath, 'r', encoding='utf-8') as f:
+            try:
+                history = json.load(f)
+                if isinstance(history, list) and all("role" in item and "content" in item for item in history):
+                    self.clear_chat()
+                    self.chat_history = history
+
+                    # Rebuild chat display
+                    for message in self.chat_history:
+                        if message["role"] != "user":
+                            self.append_text_to_chat(f"{self.model_select.get()}\n", ("Bold",))
+                            self.layout.create_inner_label(on_right_side=False)
+                        else:
+                            self.layout.create_inner_label(on_right_side=True)
+
+                        self.append_text_to_chat(message["content"], use_label=True)
+                        self.append_text_to_chat("\n\n")
+
+                else:
+                    messagebox.showerror("Error", "Invalid chat file format.", parent=self.root)
+            except json.JSONDecodeError:
+                messagebox.showerror("Error", "Could not decode JSON from file.", parent=self.root)
+
 
 class LayoutManager:
     """
@@ -462,11 +503,15 @@ class LayoutManager:
 
         file_menu = tk.Menu(menubar, tearoff=0)
         menubar.add_cascade(label="File", menu=file_menu)
+        file_menu.add_command(label="Save Chat", command=self.interface.save_chat)
+        file_menu.add_command(label="Load Chat", command=self.interface.load_chat)
+        file_menu.add_separator()
         file_menu.add_command(label="Model Management", command=self.show_model_management_window)
         file_menu.add_command(label="Exit", command=self.interface.root.quit)
 
         edit_menu = tk.Menu(menubar, tearoff=0)
         menubar.add_cascade(label="Edit", menu=edit_menu)
+
         edit_menu.add_command(label="Copy All", command=self.interface.copy_all)
         edit_menu.add_command(label="Clear Chat", command=self.interface.clear_chat)
 
