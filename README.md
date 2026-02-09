@@ -1,114 +1,155 @@
-# Ollama-GUI
+---
+
+## ✅ Updated `README.md` (Recommended)
+
+````markdown
+# Ollama-GUI (Enhanced Fork)
 
 ![GitHub License](https://img.shields.io/github/license/chyok/ollama-gui)
-![PyPI - Version](https://img.shields.io/pypi/v/ollama-gui)
-![PyPI - Python Version](https://img.shields.io/pypi/pyversions/ollama-gui)
+![Python Version](https://img.shields.io/badge/python-3.10%2B-blue)
 
-A very simple ollama GUI, implemented using the built-in Python Tkinter library, with no additional dependencies.
-Provide you with the simplest possible visual Ollama interface.
+A lightweight, local-first **Ollama GUI** built with **Python + Tkinter**, based on the
+original work by **chyok**, with stability improvements and an additional
+speech-enabled interface.
 
-![ollama-gui-1 2 0](https://github.com/user-attachments/assets/a4bb979b-68a4-4062-b484-7542f2a866e0)
+This fork preserves the original philosophy:
+> **Simple, dependency-minimal, local GUI for Ollama**
 
+while extending it in two directions:
+- **ollama-gui-enhanced** — stability & usability improvements
+- **ollama-speak** — a new GUI that can *read responses aloud*
 
-## 🚀 Features
-### v1.1.0
-+ 📁 One file project.
-+ 📦 No external dependencies, only **tkinter** which is usually bundled.
-+ 🔍 Auto check ollama model list.
-+ 🌐 Customizable ollama host support.
-+ 💬 Multiple conversations.
-+ 📋 Menu bar and right-click menu.
-+ 🛑 Stop generating at any time.
-### v1.2.0
-+ 🗂️ Model Management: Download and Delete Models.
-+ 🎨 UI Enhancement: Bubble dialog theme.
-+ 📝 Editable Conversation History.
-### v1.2.2 
-+ 💾 Save and Load Conversation History.
+---
 
-## 📎 Before Start
+## 📦 Projects in This Fork
 
-We need to set up Ollama service first.
+### 1️⃣ ollama-gui-enhanced (Text-only GUI)
+An improved version of the original `ollama_gui.py`, focused on correctness,
+responsiveness, and usability — **no speech, no extra dependencies**.
 
-Please refer to:   
-+ [Ollama](https://ollama.com/)  
-+ [Ollama Github](https://github.com/ollama/ollama)
+**Enhancements include:**
+- Proper stop/cancel handling using thread-safe cancellation
+- Network timeouts to prevent GUI lockups
+- Tkinter UI thread-safety fixes
+- Keyboard shortcut preservation (`<Return>` only, no key hijacking)
+- Revised About menu with version and contributor metadata
 
-## ⚙️ Run
+This version is ideal if you want a **clean, minimal, text-based Ollama GUI**.
 
-Choose any way you like:
-> **Note: If you are using a Mac and the system version is Sonoma, please refer to the Q&A at the bottom.**
+---
 
-### source code
+### 2️⃣ ollama-speak (Speech-Enabled GUI)
+A new GUI variant that adds **offline speech output**, allowing users to **hear**
+model responses instead of reading them.
 
-```
-python ollama_gui.py
-```
+**Key features:**
+- Enable / Disable speech toggle
+- Speaks the **final assistant response** (not partial streams)
+- Stop Speaking button
+- Uses **Piper TTS** (offline, local, no cloud)
+- Optional timbre adjustment (e.g. tenor/bright voice via SoX)
 
-### using pip
+This version is especially useful for:
+- Long responses
+- Accessibility
+- Hands-free interaction
+- Audio-first workflows
 
-```
-pip install ollama-gui
-ollama-gui
-```
+---
 
-### binary file
+## 🚀 Original Features (Preserved)
 
-| Platform | Download Link                                            | 
-|----------|----------------------------------------------------------|
-| Windows  | [Download](https://github.com/chyok/ollama-gui/releases) |
-| Mac (Apple Silicon)  | [Download](https://github.com/chyok/ollama-gui/releases) |
-| Linux  | [Download](https://github.com/chyok/ollama-gui/releases) |
+From the upstream project by **chyok**:
 
-## 📋 Q&A
-### I'm using a Mac, why does the application sometimes not respond when I click on it?
+- 📁 One-file Tkinter application
+- 📦 No external GUI dependencies
+- 🔍 Automatic Ollama model discovery
+- 🌐 Custom Ollama host support
+- 💬 Multiple conversations
+- 📋 Menu bar and right-click menu
+- 🛑 Stop generation at any time
+- 🗂️ Model download & delete
+- 💾 Save / Load conversation history
+- 📝 Editable conversation bubbles
 
-The issue affects macOS Sonoma users running applications that use Tcl/Tk versions 8.6.12 or older, including various Python versions.  
-When the mouse cursor is inside the Tkinter window during startup, GUI elements become unresponsive to clicks.
+---
 
-Solution:  
-Update to Tcl/Tk version 8.6.13 or newer, which fixes this problem.   
-  
-For Python users, this can be done by:  
-Using Python 3.11.7 or later, which bundles the fixed Tcl/Tk version.  
-Using Python 3.12 or later, which already includes the fix.  
-https://www.python.org/downloads/macos/
+## ⚙️ Requirements
 
-For other Python versions, installing Tcl/Tk 8.6.13+ separately (e.g., via Homebrew) and ensuring Python uses this version.
+### General
+- Python **3.10+**
+- Ollama running locally
 
-Here is the issue: https://github.com/python/cpython/issues/110218
+```bash
+ollama serve
+````
 
-------
+### Tkinter (if missing)
 
-### ImportError: No module named 'Tkinter'
-
-This probably happens because the Tk library is not installed.
-
-For Ubuntu or other distros with Apt:
-
-```
-sudo apt-get install python3-tk
+```bash
+sudo apt install python3-tk
 ```
 
-For Fedora:
+### Speech GUI Only (`ollama-speak`)
 
-```
-sudo dnf install python3-tkinter
-```
+* `piper` (offline TTS)
+* `alsa-utils` (`aplay`)
+* Optional: `sox` for pitch/timbre control
 
-For macOS:
-
-```
-brew install python-tk
+```bash
+sudo apt install alsa-utils sox
 ```
 
-For Windows:
+---
 
-make sure to **check in the Python install the optional feature "tcl/tk and IDLE"**.  
+## ▶️ Run
 
-Refer to: https://stackoverflow.com/questions/25905540/importerror-no-module-named-tkinter
+### Text-only enhanced GUI
 
-## License
+```bash
+python3 ollama_gui.py
+```
 
-This project is licensed under the [MIT License](LICENSE).
+### Speech-enabled GUI
 
+```bash
+python3 ollama_speak.py
+```
+
+---
+
+## 🧠 Notes
+
+* `ollama-speak` **does not replace** the original GUI — it is an **additional option**
+* Speech is local, offline, and user-controlled
+* No telemetry, no cloud APIs, no servers added
+
+---
+
+## 👥 Credits
+
+* **Original Project:** `ollama-gui` by **chyok**
+* **Enhancements & Speech GUI:** **Dr. Eric O. Flores** (with AI-assisted development)
+
+---
+
+## 📜 License
+
+MIT License
+Original work © 2024 chyok
+Enhancements © 2026 Dr. Eric O. Flores
+
+See [LICENSE](LICENSE) for details.
+
+```
+
+---
+
+## ✅ Summary (Clear Answer)
+
+- ✔ Yes, you are allowed to update the README  
+- ✔ Yes, you may document **ollama-gui-enhanced** and **ollama-speak**  
+- ✔ Your changes are MIT-compliant  
+- ✔ Attribution is preserved and clear  
+- ✔ This README follows GitHub best practices  
+```
