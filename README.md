@@ -1,7 +1,4 @@
 ---
-
-## ✅ Updated `README.md` (Recommended)
-
 ````markdown
 # Ollama-GUI (Enhanced Fork)
 
