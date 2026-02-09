@@ -1,0 +1,1071 @@
+#!/usr/bin/env python3
+"""
+ollama_speak.py
+Ollama GUI (Tkinter) + Piper TTS Speech Toggle (final-response speaking)
+
+Base project: https://github.com/chyok/ollama-gui
+Enhancements: Dr. Eric O. Flores
+Revision Date: February 9, 2026
+
+This build adds:
+- PiperSpeaker (Piper -> optional SoX pitch -> aplay) with clear diagnostics
+- Speech Enable/Disable toggle
+- Voice selection (Joe default)
+- Timbre presets (Normal / Tenor / Bright Tenor) using SoX pitch
+- Stop Speaking button
+- Speaks ONLY the final assistant response (not streaming chunks)
+"""
+
+import sys
+import json
+import time
+import pprint
+import platform
+import webbrowser
+import os
+import shutil
+import subprocess
+import threading
+
+import urllib.parse
+import urllib.request
+
+from threading import Thread, Event
+from typing import Optional, List, Generator, Callable, Any, Dict
+
+try:
+    import tkinter as tk
+    from tkinter import ttk, font, messagebox, filedialog
+except (ModuleNotFoundError, ImportError):
+    print(
+        "Your Python installation does not include the Tk library. \n"
+        "Please refer to https://github.com/chyok/ollama-gui?tab=readme-ov-file#-qa"
+    )
+    sys.exit(0)
+
+__version__ = "1.2.2"
+__revision_date__ = "February 9, 2026"
+
+
+# -------------------- Piper TTS CONFIG --------------------
+DEFAULT_PIPER_BIN = "/home/eric/.local/bin/piper"  # adjust if your path differs
+FALLBACK_PIPER_BIN = "piper"                       # use from PATH if available
+
+VOICE_MODELS = {
+    "Female (Amy)": "/opt/piper/voices/en_US-amy-low.onnx",
+    "Male (Joe)":   "/opt/piper/voices/en_US-joe-medium.onnx",
+}
+
+# Timbre presets via SoX pitch (cents); 100 cents = 1 semitone
+TIMBRE_PRESETS = {
+    "Normal": 0,
+    "Tenor (+350¢)": 350,
+    "Bright Tenor (+450¢)": 450,
+}
+
+DEBUG_LOG = True
+# ----------------------------------------------------------
+
+
+def _system_check(root: tk.Tk) -> Optional[str]:
+    def _version_tuple(v):
+        filled = []
+        for point in v.split("."):
+            filled.append(point.zfill(8))
+        return tuple(filled)
+
+    if platform.system().lower() == "darwin":
+        version = platform.mac_ver()[0]
+        if version and 14 <= float(version) < 15:
+            tcl_version = root.tk.call("info", "patchlevel")
+            if _version_tuple(tcl_version) <= _version_tuple("8.6.12"):
+                return (
+                    "Warning: Tkinter Responsiveness Issue Detected\n\n"
+                    "You may experience unresponsive GUI elements when "
+                    "your cursor is inside the window during startup. "
+                    "This is a known issue with Tcl/Tk versions 8.6.12 "
+                    "and older on macOS Sonoma.\n\nTo resolve this:\n"
+                    "Update to Python 3.11.7+ or 3.12+\n"
+                    "Or install Tcl/Tk 8.6.13 or newer separately\n\n"
+                    "Temporary workaround: Move your cursor out of "
+                    "the window and back in if elements become unresponsive.\n\n"
+                    "For more information, visit: https://github.com/python/cpython/issues/110218"
+                )
+    return None
+
+
+def resolve_piper_bin() -> str:
+    if os.path.exists(DEFAULT_PIPER_BIN) and os.access(DEFAULT_PIPER_BIN, os.X_OK):
+        return DEFAULT_PIPER_BIN
+    p = shutil.which(FALLBACK_PIPER_BIN)
+    if p:
+        return p
+    return DEFAULT_PIPER_BIN
+
+
+def load_voice_json(model_path: str) -> dict:
+    cfg_path = model_path + ".json"  # expects: *.onnx.json
+    if not os.path.exists(cfg_path):
+        raise FileNotFoundError(f"Missing voice JSON: {cfg_path}")
+    with open(cfg_path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def _spawn_with_logger(cmd, **popen_kwargs):
+    p = subprocess.Popen(cmd, **popen_kwargs)
+    if DEBUG_LOG and popen_kwargs.get("stderr") == subprocess.PIPE:
+        def _pump(proc, label):
+            try:
+                for line in iter(proc.stderr.readline, b''):
+                    sys.stderr.write(f'[{label}] {line.decode(errors="ignore")}')
+            except Exception:
+                pass
+        t = threading.Thread(target=_pump, args=(p, cmd[0]), daemon=True)
+        t.start()
+    return p
+
+
+class PiperSpeaker:
+    """
+    Piper -> optional SoX pitch -> aplay speaker with:
+    - start/stop
+    - last_error for GUI diagnostics
+    """
+
+    def __init__(self, piper_bin: Optional[str] = None):
+        self.piper_bin = piper_bin or resolve_piper_bin()
+        self._lock = threading.Lock()
+        self._procs: List[subprocess.Popen] = []
+        self._aplay_proc: Optional[subprocess.Popen] = None
+        self._speak_thread: Optional[threading.Thread] = None
+        self._stop_event = threading.Event()
+        self._last_error: str = ""
+
+    def set_error(self, msg: str) -> None:
+        with self._lock:
+            self._last_error = msg
+
+    def get_last_error(self, clear: bool = True) -> str:
+        with self._lock:
+            msg = self._last_error
+            if clear:
+                self._last_error = ""
+            return msg
+
+    def is_speaking(self) -> bool:
+        with self._lock:
+            return self._aplay_proc is not None and self._aplay_proc.poll() is None
+
+    def stop(self) -> None:
+        self._stop_event.set()
+        with self._lock:
+            for p in self._procs:
+                try:
+                    if p and p.poll() is None:
+                        p.kill()
+                except Exception:
+                    pass
+            self._procs.clear()
+            self._aplay_proc = None
+
+    @staticmethod
+    def _sanitize_text(text: str) -> str:
+        t = (text or "").strip()
+        if not t:
+            return ""
+        t = "\n".join([line.strip() for line in t.splitlines()])
+        t = t.replace("\r", "")
+        return t
+
+    def _validate_runtime(self, model_path: str, pitch_cents: int) -> int:
+        if (not os.path.exists(self.piper_bin)) and (shutil.which(self.piper_bin) is None):
+            raise FileNotFoundError(f"Piper binary not found: {self.piper_bin}")
+
+        if shutil.which("aplay") is None:
+            raise FileNotFoundError(
+                "Missing 'aplay' (ALSA utils). Install:\n  sudo apt install alsa-utils"
+            )
+
+        if pitch_cents != 0 and shutil.which("sox") is None:
+            raise FileNotFoundError(
+                "Tenor/Bright Tenor requires 'sox'. Install:\n  sudo apt install sox"
+            )
+
+        if not model_path or not os.path.exists(model_path):
+            raise FileNotFoundError(f"Piper voice model not found: {model_path}")
+
+        cfg = load_voice_json(model_path)  # expects *.onnx.json
+        sample_rate = int(cfg.get("sample_rate", 16000))
+        return sample_rate
+
+    def speak(self, text: str, model_path: str, pitch_cents: int = 0) -> None:
+        t = self._sanitize_text(text)
+        if not t:
+            return
+
+        self.stop()
+        self._stop_event.clear()
+        self.set_error("")
+
+        def _worker():
+            try:
+                sample_rate = self._validate_runtime(model_path, pitch_cents)
+
+                # Piper: raw PCM -> stdout
+                piper_cmd = [
+                    self.piper_bin,
+                    "--model", model_path,
+                    "--length-scale", "1.0",
+                    "--output-raw",
+                ]
+                p1 = _spawn_with_logger(
+                    piper_cmd,
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                )
+
+                # Optional SoX pitch stage
+                pcm_source = p1.stdout
+                p2 = None
+                if pitch_cents != 0:
+                    sox_cmd = [
+                        "sox",
+                        "-t", "raw",
+                        "-r", str(sample_rate),
+                        "-e", "signed",
+                        "-b", "16",
+                        "-c", "1",
+                        "-L",
+                        "-",
+                        "-t", "raw",
+                        "-",
+                        "pitch", str(int(pitch_cents)),
+                    ]
+                    p2 = _spawn_with_logger(
+                        sox_cmd,
+                        stdin=p1.stdout,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                    )
+                    pcm_source = p2.stdout
+
+                # aplay sink
+                aplay_cmd = [
+                    "aplay",
+                    "-r", str(sample_rate),
+                    "-f", "S16_LE",
+                    "-t", "raw",
+                    "-",
+                ]
+                p3 = _spawn_with_logger(
+                    aplay_cmd,
+                    stdin=pcm_source,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                )
+
+                with self._lock:
+                    self._procs = [p for p in (p1, p2, p3) if p is not None]
+                    self._aplay_proc = p3
+
+                # Feed Piper (newline helps)
+                if p1.stdin:
+                    try:
+                        payload = (t + "\n").encode("utf-8")
+                        p1.stdin.write(payload)
+                    finally:
+                        try:
+                            p1.stdin.close()
+                        except Exception:
+                            pass
+
+                while True:
+                    if self._stop_event.is_set():
+                        break
+                    rc = p3.poll()
+                    if rc is not None:
+                        break
+                    time.sleep(0.05)
+
+            except Exception as e:
+                self.set_error(str(e))
+                sys.stderr.write(f"[PiperSpeaker] ERROR: {e}\n")
+            finally:
+                with self._lock:
+                    for p in self._procs:
+                        try:
+                            if p and p.poll() is None:
+                                p.kill()
+                        except Exception:
+                            pass
+                    self._procs.clear()
+                    self._aplay_proc = None
+                self._stop_event.clear()
+
+        self._speak_thread = threading.Thread(target=_worker, daemon=True)
+        self._speak_thread.start()
+
+
+class OllamaInterface:
+    chat_box: tk.Text
+    user_input: tk.Text
+    host_input: ttk.Entry
+    progress: ttk.Progressbar
+    stop_button: ttk.Button
+    send_button: ttk.Button
+    refresh_button: ttk.Button
+    download_button: ttk.Button
+    delete_button: ttk.Button
+    model_select: ttk.Combobox
+    log_textbox: tk.Text
+    models_list: tk.Listbox
+
+    def __init__(self, root: tk.Tk):
+        self.root: tk.Tk = root
+        self.api_url: str = "http://127.0.0.1:11434"
+        self.chat_history: List[dict] = []
+        self.label_widgets: List[tk.Label] = []
+        self.default_font: str = font.nametofont("TkTextFont").actual()["family"]
+
+        self._ui_alive: bool = True
+        self.stop_event: Event = Event()
+        self.net_timeout: int = 30
+
+        self.piper = PiperSpeaker()
+        self.speech_enabled = tk.BooleanVar(value=False)
+        self.voice_var = tk.StringVar(value="Male (Joe)")
+        self.timbre_var = tk.StringVar(value="Tenor (+350¢)")  # default tenor
+        self.piper_model_var = tk.StringVar(value=VOICE_MODELS.get("Male (Joe)", ""))
+
+        self.layout = LayoutManager(self)
+        self.layout.init_layout()
+
+        self.root.protocol("WM_DELETE_WINDOW", self.on_close)
+
+        self.root.after(200, self.check_system)
+        self.refresh_models()
+
+    def ui(self, fn: Callable[..., Any], *args, **kwargs) -> None:
+        if not self._ui_alive:
+            return
+        try:
+            self.root.after(0, lambda: fn(*args, **kwargs))
+        except Exception:
+            pass
+
+    def ui_sync(self, fn: Callable[..., Any], *args, **kwargs) -> Any:
+        done = Event()
+        result: Dict[str, Any] = {}
+
+        def _runner():
+            try:
+                result["value"] = fn(*args, **kwargs)
+            except Exception as e:
+                result["error"] = e
+            finally:
+                done.set()
+
+        if not self._ui_alive:
+            return None
+
+        try:
+            self.root.after(0, _runner)
+            done.wait()
+        except Exception:
+            return None
+
+        if "error" in result:
+            raise result["error"]
+        return result.get("value")
+
+    def on_close(self):
+        self._ui_alive = False
+        try:
+            self.stop_event.set()
+        except Exception:
+            pass
+        try:
+            self.piper.stop()
+        except Exception:
+            pass
+        try:
+            self.root.destroy()
+        except Exception:
+            pass
+
+    def copy_text(self, text: str):
+        if text:
+            self.chat_box.clipboard_clear()
+            self.chat_box.clipboard_append(text)
+
+    def copy_all(self):
+        self.copy_text(pprint.pformat(self.chat_history))
+
+    @staticmethod
+    def open_homepage():
+        webbrowser.open("https://github.com/chyok/ollama-gui")
+
+    def show_help(self):
+        info = (
+            "Project: Ollama GUI (ollama_speak)\n"
+            f"Version: {__version__}\n"
+            f"Revision Date: {__revision_date__}\n\n"
+            "Contributors:\n"
+            " - chyok (Original Author)\n"
+            " - Dr. Eric O. Flores (Enhancements / Revisions)\n\n"
+            "Speech:\n"
+            f" - Piper binary: {self.piper.piper_bin}\n"
+            f" - Voice model: {self.piper_model_var.get()}\n"
+            f" - Timbre: {self.timbre_var.get()}\n\n"
+            "Keys:\n"
+            " <Enter>: send\n"
+            " <Shift+Enter>: new line\n"
+            " <Double click dialog>: edit dialog\n"
+        )
+        messagebox.showinfo("About", info, parent=self.root)
+
+    def show_about(self):
+        self.show_help()
+
+    def check_system(self):
+        message = _system_check(self.root)
+        if message is not None:
+            messagebox.showwarning("Warning", message, parent=self.root)
+
+    def append_text_to_chat(self, text: str, *args, use_label: bool = False):
+        self.chat_box.config(state=tk.NORMAL)
+        if use_label:
+            cur_label_widget = self.label_widgets[-1]
+            cur_label_widget.config(text=cur_label_widget.cget("text") + text)
+        else:
+            self.chat_box.insert(tk.END, text, *args)
+        self.chat_box.see(tk.END)
+        self.chat_box.config(state=tk.DISABLED)
+
+    def append_log_to_inner_textbox(self, message: Optional[str] = None, clear: bool = False):
+        if self.log_textbox.winfo_exists():
+            self.log_textbox.config(state=tk.NORMAL)
+            if clear:
+                self.log_textbox.delete(1.0, tk.END)
+            elif message:
+                self.log_textbox.insert(tk.END, message + "\n")
+            self.log_textbox.config(state=tk.DISABLED)
+            self.log_textbox.see(tk.END)
+
+    def resize_inner_text_widget(self, event: tk.Event):
+        for i in self.label_widgets:
+            current_width = event.widget.winfo_width()
+            max_width = int(current_width) * 0.7
+            i.config(wraplength=max_width)
+
+    def show_error(self, text):
+        self.model_select.set(text)
+        self.model_select.config(foreground="red")
+        self.model_select["values"] = []
+        self.send_button.state(["disabled"])
+
+    def show_process_bar(self):
+        self.progress.grid(row=0, column=0, sticky="nsew")
+        self.stop_button.grid(row=0, column=1, padx=20)
+        self.progress.start(5)
+
+    def hide_process_bar(self):
+        self.progress.stop()
+        self.stop_button.grid_remove()
+        self.progress.grid_remove()
+
+    def request_stop(self):
+        self.stop_event.set()
+        try:
+            self.stop_button.state(["disabled"])
+        except Exception:
+            pass
+
+    def prepare_new_request(self):
+        self.stop_event.clear()
+        try:
+            self.stop_button.state(["!disabled"])
+        except Exception:
+            pass
+
+    def handle_key_press(self, event: tk.Event):
+        if event.keysym == "Return":
+            if event.state & 0x1 == 0x1:
+                self.user_input.insert("end", "\n")
+            elif "disabled" not in self.send_button.state():
+                self.on_send_button(event)
+            return "break"
+
+    def refresh_models(self):
+        self.update_host()
+        self.model_select.config(foreground="black")
+        self.model_select.set("Waiting...")
+        self.send_button.state(["disabled"])
+        self.refresh_button.state(["disabled"])
+        Thread(target=self.update_model_select, daemon=True).start()
+
+    def update_host(self):
+        self.api_url = self.host_input.get()
+
+    def update_model_select(self):
+        try:
+            models = self.fetch_models()
+
+            def _apply_models():
+                self.model_select["values"] = models
+                if models:
+                    self.model_select.set(models[0])
+                    self.send_button.state(["!disabled"])
+                else:
+                    self.show_error("You need download a model!")
+
+            self.ui(_apply_models)
+
+        except Exception:  # noqa
+            self.ui(self.show_error, "Error! Please check the host.")
+        finally:
+            self.ui(lambda: self.refresh_button.state(["!disabled"]))
+
+    def update_model_list(self):
+        try:
+            models = self.fetch_models()
+
+            def _populate():
+                if self.models_list.winfo_exists():
+                    self.models_list.delete(0, tk.END)
+                    for model in models:
+                        self.models_list.insert(tk.END, model)
+
+            self.ui(_populate)
+
+        except Exception:  # noqa
+            self.ui(self.append_log_to_inner_textbox, "Error! Please check the Ollama host.")
+
+    def _update_voice_model_from_ui(self):
+        key = (self.voice_var.get() or "").strip()
+        model = VOICE_MODELS.get(key, VOICE_MODELS.get("Male (Joe)", ""))
+        self.piper_model_var.set(model)
+
+    def _get_pitch_cents(self) -> int:
+        return int(TIMBRE_PRESETS.get(self.timbre_var.get(), 0))
+
+    def on_toggle_speech(self):
+        if not self.speech_enabled.get():
+            try:
+                self.piper.stop()
+            except Exception:
+                pass
+            return
+
+        try:
+            self._update_voice_model_from_ui()
+            model_path = self.piper_model_var.get()
+            pitch_cents = self._get_pitch_cents()
+            _ = self.piper._validate_runtime(model_path, pitch_cents)
+        except Exception as e:
+            self.speech_enabled.set(False)
+            messagebox.showerror(
+                "Speech Not Ready",
+                "Speech could not be enabled.\n\n"
+                f"Reason:\n{e}\n\n"
+                "Verify:\n"
+                f" - Piper exists: {self.piper.piper_bin}\n"
+                f" - Model exists: {self.piper_model_var.get()}\n"
+                f" - JSON exists: {self.piper_model_var.get()}.json\n"
+                " - 'aplay' exists (alsa-utils)\n"
+                " - 'sox' exists (required for Tenor presets)\n",
+                parent=self.root
+            )
+
+    def on_voice_changed(self, _=None):
+        self._update_voice_model_from_ui()
+        if self.speech_enabled.get():
+            self.on_toggle_speech()
+
+    def on_timbre_changed(self, _=None):
+        if self.speech_enabled.get():
+            self.on_toggle_speech()
+
+    def stop_speaking(self):
+        try:
+            self.piper.stop()
+        except Exception:
+            pass
+
+    def on_send_button(self, _=None):
+        message = self.user_input.get("1.0", "end-1c")
+        if message:
+            self.layout.create_inner_label(on_right_side=True, msg_index=len(self.chat_history))
+            self.append_text_to_chat(f"{message}", use_label=True)
+            self.append_text_to_chat("\n\n")
+            self.user_input.delete("1.0", "end")
+            self.chat_history.append({"role": "user", "content": message})
+            Thread(target=self.generate_ai_response, daemon=True).start()
+
+    def generate_ai_response(self):
+        ai_message = ""
+        try:
+            self.ui_sync(self.show_process_bar)
+            self.ui(self.prepare_new_request)
+
+            self.ui(lambda: self.send_button.state(["disabled"]))
+            self.ui(lambda: self.refresh_button.state(["disabled"]))
+
+            model_name = self.model_select.get()
+            self.ui(self.append_text_to_chat, f"{model_name}\n", ("Bold",))
+
+            self.ui_sync(lambda: self.layout.create_inner_label(on_right_side=False, msg_index=len(self.chat_history)))
+
+            for chunk in self.fetch_chat_stream_result():
+                if self.stop_event.is_set():
+                    break
+                self.ui(self.append_text_to_chat, f"{chunk}", use_label=True)
+                ai_message += chunk
+
+            if self.stop_event.is_set():
+                if ai_message.strip():
+                    self.chat_history.append({"role": "assistant", "content": ai_message})
+                self.ui(self.append_text_to_chat, "\n\n[Stopped]\n\n", ("Error",))
+            else:
+                self.chat_history.append({"role": "assistant", "content": ai_message})
+                self.ui(self.append_text_to_chat, "\n\n")
+
+                def _speak_if_enabled():
+                    try:
+                        if self.speech_enabled.get():
+                            self._update_voice_model_from_ui()
+                            model_path = self.piper_model_var.get()
+                            pitch_cents = self._get_pitch_cents()
+                            self.piper.speak(ai_message, model_path=model_path, pitch_cents=pitch_cents)
+
+                            def _check_speech_error():
+                                err = self.piper.get_last_error(clear=True)
+                                if err:
+                                    messagebox.showerror(
+                                        "Speech Error",
+                                        "Speech failed.\n\n"
+                                        f"{err}\n\n"
+                                        "Common causes:\n"
+                                        " - Piper path wrong\n"
+                                        " - Voice model/.json missing\n"
+                                        " - 'aplay' missing\n"
+                                        " - 'sox' missing (Tenor presets)\n",
+                                        parent=self.root
+                                    )
+                            self.root.after(300, _check_speech_error)
+                    except Exception as e:
+                        messagebox.showerror("Speech Error", str(e), parent=self.root)
+
+                self.ui(_speak_if_enabled)
+
+        except Exception:  # noqa
+            self.ui(self.append_text_to_chat, "\nAI error!\n\n", ("Error",))
+        finally:
+            self.ui(self.hide_process_bar)
+            self.ui(lambda: self.send_button.state(["!disabled"]))
+            self.ui(lambda: self.refresh_button.state(["!disabled"]))
+            self.ui(lambda: self.stop_button.state(["!disabled"]))
+
+    def fetch_models(self) -> List[str]:
+        with urllib.request.urlopen(
+            urllib.parse.urljoin(self.api_url, "/api/tags"),
+            timeout=self.net_timeout,
+        ) as response:
+            data = json.load(response)
+            return [model["name"] for model in data.get("models", [])]
+
+    def fetch_chat_stream_result(self) -> Generator:
+        request = urllib.request.Request(
+            urllib.parse.urljoin(self.api_url, "/api/chat"),
+            data=json.dumps(
+                {
+                    "model": self.model_select.get(),
+                    "messages": self.chat_history,
+                    "stream": True,
+                }
+            ).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(request, timeout=self.net_timeout) as resp:
+            for line in resp:
+                if self.stop_event.is_set():
+                    break
+                data = json.loads(line.decode("utf-8"))
+                if "message" in data:
+                    time.sleep(0.01)
+                    yield data["message"]["content"]
+
+    def delete_model(self, model_name: str):
+        self.ui(self.append_log_to_inner_textbox, clear=True)
+        if not model_name:
+            return
+        req = urllib.request.Request(
+            urllib.parse.urljoin(self.api_url, "/api/delete"),
+            data=json.dumps({"name": model_name}).encode("utf-8"),
+            method="DELETE",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=self.net_timeout) as response:
+                if response.status == 200:
+                    self.ui(self.append_log_to_inner_textbox, "Model deleted successfully.")
+                elif response.status == 404:
+                    self.ui(self.append_log_to_inner_textbox, "Model not found.")
+                else:
+                    self.ui(self.append_log_to_inner_textbox, f"Delete returned status: {response.status}")
+        except Exception as e:
+            self.ui(self.append_log_to_inner_textbox, f"Failed to delete model: {e}")
+        finally:
+            Thread(target=self.update_model_list, daemon=True).start()
+            Thread(target=self.update_model_select, daemon=True).start()
+
+    def download_model(self, model_name: str, insecure: bool = False):
+        self.ui(self.append_log_to_inner_textbox, clear=True)
+        if not model_name:
+            return
+        self.ui(lambda: self.download_button.state(["disabled"]))
+        req = urllib.request.Request(
+            urllib.parse.urljoin(self.api_url, "/api/pull"),
+            data=json.dumps({"name": model_name, "insecure": insecure, "stream": True}).encode("utf-8"),
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=self.net_timeout) as response:
+                for line in response:
+                    if self.stop_event.is_set():
+                        self.ui(self.append_log_to_inner_textbox, "Download stopped.")
+                        break
+                    data = json.loads(line.decode("utf-8"))
+                    log = data.get("error") or data.get("status") or "No response"
+                    if "status" in data:
+                        total = data.get("total")
+                        completed = data.get("completed", 0)
+                        if total:
+                            log += f" [{completed}/{total}]"
+                    self.ui(self.append_log_to_inner_textbox, log)
+        except Exception as e:
+            self.ui(self.append_log_to_inner_textbox, f"Failed to download model: {e}")
+        finally:
+            Thread(target=self.update_model_list, daemon=True).start()
+            Thread(target=self.update_model_select, daemon=True).start()
+
+            def _reenable():
+                if self.download_button.winfo_exists():
+                    self.download_button.state(["!disabled"])
+            self.ui(_reenable)
+
+    def clear_chat(self):
+        for i in self.label_widgets:
+            i.destroy()
+        self.label_widgets.clear()
+        self.chat_box.config(state=tk.NORMAL)
+        self.chat_box.delete(1.0, tk.END)
+        self.chat_box.config(state=tk.DISABLED)
+        self.chat_history.clear()
+
+    def save_chat(self):
+        filepath = filedialog.asksaveasfilename(
+            defaultextension=".json",
+            filetypes=[("JSON files", "*.json"), ("All files", "*.*")],
+            title="Save Chat As",
+        )
+        if filepath:
+            with open(filepath, "w", encoding="utf-8") as f:
+                json.dump(self.chat_history, f, indent=2)
+
+    def load_chat(self):
+        filepath = filedialog.askopenfilename(
+            filetypes=[("JSON files", "*.json"), ("All files", "*.*")],
+            title="Load Chat",
+        )
+        if not filepath:
+            return
+        with open(filepath, "r", encoding="utf-8") as f:
+            history = json.load(f)
+            if isinstance(history, list) and all("role" in item and "content" in item for item in history):
+                self.clear_chat()
+                self.chat_history = history
+                for idx, message in enumerate(self.chat_history):
+                    if message["role"] != "user":
+                        self.append_text_to_chat(f"{self.model_select.get()}\n", ("Bold",))
+                        self.layout.create_inner_label(on_right_side=False, msg_index=idx)
+                    else:
+                        self.layout.create_inner_label(on_right_side=True, msg_index=idx)
+                    self.append_text_to_chat(message["content"], use_label=True)
+                    self.append_text_to_chat("\n\n")
+            else:
+                messagebox.showerror("Error", "Invalid chat file format.", parent=self.root)
+
+
+class LayoutManager:
+    def __init__(self, interface: OllamaInterface):
+        self.interface: OllamaInterface = interface
+        self.management_window: Optional[tk.Toplevel] = None
+        self.editor_window: Optional[tk.Toplevel] = None
+
+    def init_layout(self):
+        self._header_frame()
+        self._chat_container_frame()
+        self._processbar_frame()
+        self._input_frame()
+
+    def _header_frame(self):
+        header_frame = ttk.Frame(self.interface.root)
+        header_frame.grid(row=0, column=0, sticky="ew", padx=20, pady=20)
+
+        model_select = ttk.Combobox(header_frame, state="readonly", width=30)
+        model_select.grid(row=0, column=0)
+
+        settings_button = ttk.Button(header_frame, text="⚙️", command=self.show_model_management_window, width=3)
+        settings_button.grid(row=0, column=1, padx=(5, 0))
+
+        refresh_button = ttk.Button(header_frame, text="Refresh", command=self.interface.refresh_models)
+        refresh_button.grid(row=0, column=2, padx=(5, 10))
+
+        speech_chk = ttk.Checkbutton(
+            header_frame,
+            text="Speech",
+            variable=self.interface.speech_enabled,
+            command=self.interface.on_toggle_speech
+        )
+        speech_chk.grid(row=0, column=3, padx=(0, 8), sticky="w")
+
+        voice_select = ttk.Combobox(
+            header_frame,
+            state="readonly",
+            width=14,
+            textvariable=self.interface.voice_var,
+            values=list(VOICE_MODELS.keys())
+        )
+        if "Male (Joe)" in VOICE_MODELS:
+            self.interface.voice_var.set("Male (Joe)")
+        elif list(VOICE_MODELS.keys()):
+            self.interface.voice_var.set(list(VOICE_MODELS.keys())[0])
+        voice_select.grid(row=0, column=4, padx=(0, 8), sticky="w")
+        voice_select.bind("<<ComboboxSelected>>", self.interface.on_voice_changed)
+
+        timbre_select = ttk.Combobox(
+            header_frame,
+            state="readonly",
+            width=16,
+            textvariable=self.interface.timbre_var,
+            values=list(TIMBRE_PRESETS.keys())
+        )
+        if self.interface.timbre_var.get() not in TIMBRE_PRESETS:
+            self.interface.timbre_var.set("Tenor (+350¢)")
+        timbre_select.grid(row=0, column=5, padx=(0, 8), sticky="w")
+        timbre_select.bind("<<ComboboxSelected>>", self.interface.on_timbre_changed)
+
+        stop_speak_btn = ttk.Button(header_frame, text="Stop Speaking", command=self.interface.stop_speaking)
+        stop_speak_btn.grid(row=0, column=6, padx=(0, 10))
+
+        ttk.Label(header_frame, text="Host:").grid(row=0, column=7, padx=(10, 0))
+
+        host_input = ttk.Entry(header_frame, width=24)
+        host_input.grid(row=0, column=8, padx=(5, 0))
+        host_input.insert(0, self.interface.api_url)
+
+        self.interface.model_select = model_select
+        self.interface.refresh_button = refresh_button
+        self.interface.host_input = host_input
+
+    def _chat_container_frame(self):
+        chat_frame = ttk.Frame(self.interface.root)
+        chat_frame.grid(row=1, column=0, sticky="nsew", padx=20)
+        chat_frame.grid_columnconfigure(0, weight=1)
+        chat_frame.grid_rowconfigure(0, weight=1)
+
+        chat_box = tk.Text(
+            chat_frame,
+            wrap=tk.WORD,
+            state=tk.DISABLED,
+            font=(self.interface.default_font, 12),
+            spacing1=5,
+            highlightthickness=0,
+        )
+        chat_box.grid(row=0, column=0, sticky="nsew")
+
+        scrollbar = ttk.Scrollbar(chat_frame, orient="vertical", command=chat_box.yview)
+        scrollbar.grid(row=0, column=1, sticky="ns")
+        chat_box.configure(yscrollcommand=scrollbar.set)
+
+        chat_box_menu = tk.Menu(chat_box, tearoff=0)
+        chat_box_menu.add_command(label="Copy All", command=self.interface.copy_all)
+        chat_box_menu.add_separator()
+        chat_box_menu.add_command(label="Clear Chat", command=self.interface.clear_chat)
+        chat_box.bind("<Configure>", self.interface.resize_inner_text_widget)
+
+        _right_click = "<Button-2>" if platform.system().lower() == "darwin" else "<Button-3>"
+        chat_box.bind(_right_click, lambda e: chat_box_menu.post(e.x_root, e.y_root))
+
+        self.interface.chat_box = chat_box
+
+    def _processbar_frame(self):
+        process_frame = ttk.Frame(self.interface.root, height=28)
+        process_frame.grid(row=2, column=0, sticky="ew", padx=20, pady=10)
+
+        progress = ttk.Progressbar(process_frame, mode="indeterminate", style="LoadingBar.Horizontal.TProgressbar")
+        stop_button = ttk.Button(process_frame, width=5, text="Stop", command=self.interface.request_stop)
+
+        self.interface.progress = progress
+        self.interface.stop_button = stop_button
+
+    def _input_frame(self):
+        input_frame = ttk.Frame(self.interface.root)
+        input_frame.grid(row=3, column=0, sticky="ew", padx=20, pady=(0, 20))
+        input_frame.grid_columnconfigure(0, weight=1)
+
+        user_input = tk.Text(input_frame, font=(self.interface.default_font, 12), height=4, wrap=tk.WORD)
+        user_input.grid(row=0, column=0, sticky="ew", padx=(0, 10))
+
+        # Bind ONLY Return
+        user_input.bind("<Return>", self.interface.handle_key_press)
+
+        send_button = ttk.Button(input_frame, text="Send", command=self.interface.on_send_button)
+        send_button.grid(row=0, column=1)
+        send_button.state(["disabled"])
+
+        menubar = tk.Menu(self.interface.root)
+        self.interface.root.config(menu=menubar)
+
+        file_menu = tk.Menu(menubar, tearoff=0)
+        menubar.add_cascade(label="File", menu=file_menu)
+        file_menu.add_command(label="Save Chat", command=self.interface.save_chat)
+        file_menu.add_command(label="Load Chat", command=self.interface.load_chat)
+        file_menu.add_separator()
+        file_menu.add_command(label="Model Management", command=self.show_model_management_window)
+        file_menu.add_command(label="Exit", command=self.interface.root.quit)
+
+        edit_menu = tk.Menu(menubar, tearoff=0)
+        menubar.add_cascade(label="Edit", menu=edit_menu)
+        edit_menu.add_command(label="Copy All", command=self.interface.copy_all)
+        edit_menu.add_command(label="Clear Chat", command=self.interface.clear_chat)
+
+        about_menu = tk.Menu(menubar, tearoff=0)
+        menubar.add_cascade(label="About", menu=about_menu)
+        about_menu.add_command(label="Source Code", command=self.interface.open_homepage)
+        about_menu.add_command(label="About", command=self.interface.show_about)
+
+        self.interface.user_input = user_input
+        self.interface.send_button = send_button
+
+    def show_model_management_window(self):
+        self.interface.update_host()
+
+        if self.management_window and self.management_window.winfo_exists():
+            self.management_window.lift()
+            return
+
+        management_window = tk.Toplevel(self.interface.root)
+        management_window.title("Model Management")
+        screen_width = self.interface.root.winfo_screenwidth()
+        screen_height = self.interface.root.winfo_screenheight()
+        x = int((screen_width / 2) - (400 / 2))
+        y = int((screen_height / 2) - (500 / 2))
+        management_window.geometry(f"{400}x{500}+{x}+{y}")
+
+        management_window.grid_columnconfigure(0, weight=1)
+        management_window.grid_rowconfigure(3, weight=1)
+
+        frame = ttk.Frame(management_window)
+        frame.grid(row=0, column=0, sticky="ew", padx=10, pady=10)
+        frame.grid_columnconfigure(0, weight=1)
+
+        model_name_input = ttk.Entry(frame)
+        model_name_input.grid(row=0, column=0, sticky="ew", padx=(0, 5))
+
+        def _download():
+            arg = model_name_input.get().strip()
+            if arg.startswith("ollama run "):
+                arg = arg[11:]
+            self.interface.stop_event.clear()
+            Thread(target=self.interface.download_model, daemon=True, args=(arg,)).start()
+
+        def _delete():
+            arg = models_list.get(tk.ACTIVE).strip()
+            Thread(target=self.interface.delete_model, daemon=True, args=(arg,)).start()
+
+        download_button = ttk.Button(frame, text="Download", command=_download)
+        download_button.grid(row=0, column=1, sticky="ew")
+
+        tips = tk.Label(frame, text="find models: https://ollama.com/library", fg="blue", cursor="hand2")
+        tips.bind("<Button-1>", lambda e: webbrowser.open("https://ollama.com/library"))
+        tips.grid(row=1, column=0, sticky="W", padx=(0, 5), pady=5)
+
+        list_action_frame = ttk.Frame(management_window)
+        list_action_frame.grid(row=2, column=0, sticky="nsew", padx=10, pady=(0, 10))
+        list_action_frame.grid_columnconfigure(0, weight=1)
+        list_action_frame.grid_rowconfigure(0, weight=1)
+
+        models_list = tk.Listbox(list_action_frame)
+        models_list.grid(row=0, column=0, sticky="nsew")
+
+        scrollbar = ttk.Scrollbar(list_action_frame, orient="vertical", command=models_list.yview)
+        scrollbar.grid(row=0, column=1, sticky="ns")
+        models_list.config(yscrollcommand=scrollbar.set)
+
+        delete_button = ttk.Button(list_action_frame, text="Delete", command=_delete)
+        delete_button.grid(row=0, column=2, sticky="ew", padx=(5, 0))
+
+        log_textbox = tk.Text(management_window)
+        log_textbox.grid(row=3, column=0, sticky="nsew", padx=10, pady=(0, 10))
+        log_textbox.config(state="disabled")
+
+        self.management_window = management_window
+        self.interface.log_textbox = log_textbox
+        self.interface.download_button = download_button
+        self.interface.delete_button = delete_button
+        self.interface.models_list = models_list
+
+        Thread(target=self.interface.update_model_list, daemon=True).start()
+
+    def create_inner_label(self, on_right_side: bool = False, msg_index: Optional[int] = None):
+        background = "#48a4f2" if on_right_side else "#eaeaea"
+        foreground = "white" if on_right_side else "black"
+        max_width = int(self.interface.chat_box.winfo_reqwidth()) * 0.7
+        inner_label = tk.Label(
+            self.interface.chat_box,
+            justify=tk.LEFT,
+            wraplength=max_width,
+            background=background,
+            highlightthickness=0,
+            highlightbackground=background,
+            foreground=foreground,
+            padx=8,
+            pady=8,
+            font=(self.interface.default_font, 12),
+            borderwidth=0,
+        )
+        self.interface.label_widgets.append(inner_label)
+        self.interface.chat_box.window_create(tk.END, window=inner_label)
+        if on_right_side:
+            idx = self.interface.chat_box.index("end-1c").split(".")[0]
+            self.interface.chat_box.tag_add("Right", f"{idx}.0", f"{idx}.end")
+        return inner_label
+
+
+def run():
+    root = tk.Tk()
+    root.title("Ollama GUI (Speak)")
+
+    screen_width = root.winfo_screenwidth()
+    screen_height = root.winfo_screenheight()
+    root.geometry(f"1060x600+{(screen_width - 1060) // 2}+{(screen_height - 600) // 2}")
+
+    root.grid_columnconfigure(0, weight=1)
+    root.grid_rowconfigure(1, weight=1)
+    root.grid_rowconfigure(2, weight=0)
+    root.grid_rowconfigure(3, weight=0)
+
+    app = OllamaInterface(root)
+
+    app.chat_box.tag_configure("Bold", foreground="#ff007b", font=(app.default_font, 10, "bold"))
+    app.chat_box.tag_configure("Error", foreground="red")
+    app.chat_box.tag_configure("Right", justify="right")
+
+    root.mainloop()
+
+
+if __name__ == "__main__":
+    run()
