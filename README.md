@@ -1,5 +1,3 @@
----
-````markdown
 # Ollama-GUI (Enhanced Fork)
 
 ![GitHub License](https://img.shields.io/github/license/chyok/ollama-gui)
