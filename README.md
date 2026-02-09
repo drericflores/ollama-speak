@@ -124,7 +124,7 @@ python3 ollama_speak.py
 ## 👥 Credits
 
 * **Original Project:** `ollama-gui` by **chyok**
-* **Enhancements & Speech GUI:** **Dr. Eric O. Flores** (with AI-assisted development)
+* **Enhancements & Speech GUI:** **Dr. Eric O. Flores**
 
 ---
 
