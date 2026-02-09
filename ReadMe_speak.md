@@ -189,7 +189,7 @@ Use a tenor/bright preset (SoX pitch shift) or switch to a different Piper voice
 ## Credits
 
 * **Original Project:** `ollama-gui` by **chyok**
-* **This Fork:** Enhancements and speech GUI additions by **Dr. Eric O. Flores** (with assistance)
+* **This Fork:** Enhancements and speech GUI additions by **Dr. Eric O. Flores**
 
 ---
 
