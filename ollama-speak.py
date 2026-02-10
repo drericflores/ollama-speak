@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 ollama_speak.py
-Ollama GUI (Tkinter) + Piper TTS Speech Toggle (final-response speaking)
+Ollama GUI (Tkinter) + Piper TTS Speech Toggle (stream-synchronized speaking)
 
 Base project: https://github.com/chyok/ollama-gui
 Enhancements: Dr. Eric O. Flores
@@ -13,7 +13,12 @@ This build adds:
 - Voice selection (Joe default)
 - Timbre presets (Normal / Tenor / Bright Tenor) using SoX pitch
 - Stop Speaking button
-- Speaks ONLY the final assistant response (not streaming chunks)
+
+ARCH FIXES (per problem statement):
+1) Sentence-level buffer interception from streaming tokens
+2) Serialized consumer pattern (queue + single playback worker)
+3) Markdown sanitization before TTS
+4) In-memory JSON config caching for voice models
 """
 
 import sys
@@ -26,12 +31,14 @@ import os
 import shutil
 import subprocess
 import threading
+import queue
+import re
 
 import urllib.parse
 import urllib.request
 
 from threading import Thread, Event
-from typing import Optional, List, Generator, Callable, Any, Dict
+from typing import Optional, List, Generator, Callable, Any, Dict, Tuple
 
 try:
     import tkinter as tk
@@ -43,8 +50,8 @@ except (ModuleNotFoundError, ImportError):
     )
     sys.exit(0)
 
-__version__ = "1.2.2"
-__revision_date__ = "February 9, 2026"
+__version__ = "1.3.0"
+__revision_date__ = "February 10, 2026"
 
 
 # -------------------- Piper TTS CONFIG --------------------
@@ -65,6 +72,21 @@ TIMBRE_PRESETS = {
 
 DEBUG_LOG = True
 # ----------------------------------------------------------
+
+
+# ---------------- Sentence detection (stream -> sentences) ----------------
+# End-of-sentence delimiters: . ! ? \n
+# We extract the earliest complete sentence(s) and keep the remainder in buffer.
+_SENTENCE_SPLIT_RE = re.compile(r"""
+    (                       # capture a sentence
+      .*?                   # minimal
+      (?:[.!?]+|\n)         # sentence delimiter(s) or newline
+    )
+""", re.VERBOSE | re.DOTALL)
+
+# A fallback flush if the model streams a long fragment with no punctuation:
+_MAX_BUFFER_BEFORE_SOFT_FLUSH = 500
+# ------------------------------------------------------------------------
 
 
 def _system_check(root: tk.Tk) -> Optional[str]:
@@ -103,14 +125,6 @@ def resolve_piper_bin() -> str:
     return DEFAULT_PIPER_BIN
 
 
-def load_voice_json(model_path: str) -> dict:
-    cfg_path = model_path + ".json"  # expects: *.onnx.json
-    if not os.path.exists(cfg_path):
-        raise FileNotFoundError(f"Missing voice JSON: {cfg_path}")
-    with open(cfg_path, "r", encoding="utf-8") as f:
-        return json.load(f)
-
-
 def _spawn_with_logger(cmd, **popen_kwargs):
     p = subprocess.Popen(cmd, **popen_kwargs)
     if DEBUG_LOG and popen_kwargs.get("stderr") == subprocess.PIPE:
@@ -125,21 +139,84 @@ def _spawn_with_logger(cmd, **popen_kwargs):
     return p
 
 
+def _extract_sentences(buffer: str) -> Tuple[List[str], str]:
+    """
+    Given a growing buffer, return (sentences, remainder).
+    Sentences include their delimiter.
+    """
+    if not buffer:
+        return [], ""
+
+    out: List[str] = []
+    last_end = 0
+    for m in _SENTENCE_SPLIT_RE.finditer(buffer):
+        s = m.group(1)
+        if s is not None:
+            out.append(s)
+            last_end = m.end()
+
+    remainder = buffer[last_end:] if last_end > 0 else buffer
+    return out, remainder
+
+
+def _strip_markdown(text: str) -> str:
+    """
+    Transparent markdown sanitization:
+    remove formatting tokens but keep readable words and punctuation.
+    """
+    t = text or ""
+    if not t.strip():
+        return ""
+
+    # Remove fenced code blocks
+    t = re.sub(r"```.*?```", " ", t, flags=re.DOTALL)
+    # Remove inline code
+    t = re.sub(r"`([^`]*)`", r"\1", t)
+    # Bold/italic markers
+    t = re.sub(r"\*\*(.*?)\*\*", r"\1", t)
+    t = re.sub(r"\*(.*?)\*", r"\1", t)
+    t = re.sub(r"__(.*?)__", r"\1", t)
+    t = re.sub(r"_(.*?)_", r"\1", t)
+
+    # Markdown links: [text](url) -> text
+    t = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", t)
+
+    # Headings/bullets
+    t = re.sub(r"^\s*#+\s*", "", t, flags=re.MULTILINE)
+    t = re.sub(r"^\s*[-*+]\s+", "", t, flags=re.MULTILINE)
+
+    # Collapse whitespace
+    t = re.sub(r"[ \t]+", " ", t)
+    t = re.sub(r"\n{3,}", "\n\n", t)
+
+    return t.strip()
+
+
 class PiperSpeaker:
     """
     Piper -> optional SoX pitch -> aplay speaker with:
+    - serialized playback queue (single worker thread)
     - start/stop
     - last_error for GUI diagnostics
+    - in-memory JSON caching per model_path
     """
 
     def __init__(self, piper_bin: Optional[str] = None):
         self.piper_bin = piper_bin or resolve_piper_bin()
+
         self._lock = threading.Lock()
         self._procs: List[subprocess.Popen] = []
         self._aplay_proc: Optional[subprocess.Popen] = None
-        self._speak_thread: Optional[threading.Thread] = None
         self._stop_event = threading.Event()
         self._last_error: str = ""
+
+        # Sentence queue + worker (serialized consumer)
+        self._queue: "queue.Queue[Tuple[str, str, int]]" = queue.Queue()
+        self._worker = threading.Thread(target=self._worker_loop, daemon=True)
+        self._worker.start()
+
+        # JSON cache
+        self._voice_json_cache: Dict[str, dict] = {}
 
     def set_error(self, msg: str) -> None:
         with self._lock:
@@ -157,7 +234,19 @@ class PiperSpeaker:
             return self._aplay_proc is not None and self._aplay_proc.poll() is None
 
     def stop(self) -> None:
+        """
+        Stops current playback and clears pending queue items.
+        """
         self._stop_event.set()
+
+        # Clear queued sentences
+        try:
+            while True:
+                _ = self._queue.get_nowait()
+        except queue.Empty:
+            pass
+
+        # Kill current pipeline
         with self._lock:
             for p in self._procs:
                 try:
@@ -169,13 +258,28 @@ class PiperSpeaker:
             self._aplay_proc = None
 
     @staticmethod
-    def _sanitize_text(text: str) -> str:
+    def _sanitize_text_basic(text: str) -> str:
         t = (text or "").strip()
         if not t:
             return ""
         t = "\n".join([line.strip() for line in t.splitlines()])
         t = t.replace("\r", "")
         return t
+
+    def _load_voice_json_cached(self, model_path: str) -> dict:
+        with self._lock:
+            if model_path in self._voice_json_cache:
+                return self._voice_json_cache[model_path]
+
+        cfg_path = model_path + ".json"  # expects: *.onnx.json
+        if not os.path.exists(cfg_path):
+            raise FileNotFoundError(f"Missing voice JSON: {cfg_path}")
+        with open(cfg_path, "r", encoding="utf-8") as f:
+            cfg = json.load(f)
+
+        with self._lock:
+            self._voice_json_cache[model_path] = cfg
+        return cfg
 
     def _validate_runtime(self, model_path: str, pitch_cents: int) -> int:
         if (not os.path.exists(self.piper_bin)) and (shutil.which(self.piper_bin) is None):
@@ -194,117 +298,135 @@ class PiperSpeaker:
         if not model_path or not os.path.exists(model_path):
             raise FileNotFoundError(f"Piper voice model not found: {model_path}")
 
-        cfg = load_voice_json(model_path)  # expects *.onnx.json
+        cfg = self._load_voice_json_cached(model_path)
         sample_rate = int(cfg.get("sample_rate", 16000))
         return sample_rate
 
-    def speak(self, text: str, model_path: str, pitch_cents: int = 0) -> None:
-        t = self._sanitize_text(text)
+    def enqueue_sentence(self, text: str, model_path: str, pitch_cents: int = 0) -> None:
+        """
+        Public API: enqueue sanitized sentence for serialized playback.
+        """
+        t = self._sanitize_text_basic(text)
         if not t:
             return
 
-        self.stop()
-        self._stop_event.clear()
-        self.set_error("")
+        # markdown sanitization (transparent)
+        t = _strip_markdown(t)
+        if not t:
+            return
 
-        def _worker():
+        self._queue.put((t, model_path, int(pitch_cents)))
+
+    def _worker_loop(self) -> None:
+        while True:
             try:
-                sample_rate = self._validate_runtime(model_path, pitch_cents)
-
-                # Piper: raw PCM -> stdout
-                piper_cmd = [
-                    self.piper_bin,
-                    "--model", model_path,
-                    "--length-scale", "1.0",
-                    "--output-raw",
-                ]
-                p1 = _spawn_with_logger(
-                    piper_cmd,
-                    stdin=subprocess.PIPE,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                )
-
-                # Optional SoX pitch stage
-                pcm_source = p1.stdout
-                p2 = None
-                if pitch_cents != 0:
-                    sox_cmd = [
-                        "sox",
-                        "-t", "raw",
-                        "-r", str(sample_rate),
-                        "-e", "signed",
-                        "-b", "16",
-                        "-c", "1",
-                        "-L",
-                        "-",
-                        "-t", "raw",
-                        "-",
-                        "pitch", str(int(pitch_cents)),
-                    ]
-                    p2 = _spawn_with_logger(
-                        sox_cmd,
-                        stdin=p1.stdout,
-                        stdout=subprocess.PIPE,
-                        stderr=subprocess.PIPE,
-                    )
-                    pcm_source = p2.stdout
-
-                # aplay sink
-                aplay_cmd = [
-                    "aplay",
-                    "-r", str(sample_rate),
-                    "-f", "S16_LE",
-                    "-t", "raw",
-                    "-",
-                ]
-                p3 = _spawn_with_logger(
-                    aplay_cmd,
-                    stdin=pcm_source,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                )
-
-                with self._lock:
-                    self._procs = [p for p in (p1, p2, p3) if p is not None]
-                    self._aplay_proc = p3
-
-                # Feed Piper (newline helps)
-                if p1.stdin:
-                    try:
-                        payload = (t + "\n").encode("utf-8")
-                        p1.stdin.write(payload)
-                    finally:
-                        try:
-                            p1.stdin.close()
-                        except Exception:
-                            pass
-
-                while True:
-                    if self._stop_event.is_set():
-                        break
-                    rc = p3.poll()
-                    if rc is not None:
-                        break
-                    time.sleep(0.05)
-
+                text, model_path, pitch_cents = self._queue.get()
+                # If stop was requested, drop items until cleared and reset stop flag
+                if self._stop_event.is_set():
+                    self._stop_event.clear()
+                    continue
+                self._speak_blocking(text, model_path=model_path, pitch_cents=pitch_cents)
             except Exception as e:
                 self.set_error(str(e))
                 sys.stderr.write(f"[PiperSpeaker] ERROR: {e}\n")
-            finally:
-                with self._lock:
-                    for p in self._procs:
-                        try:
-                            if p and p.poll() is None:
-                                p.kill()
-                        except Exception:
-                            pass
-                    self._procs.clear()
-                    self._aplay_proc = None
-                self._stop_event.clear()
 
-        self._speak_thread = threading.Thread(target=_worker, daemon=True)
-        self._speak_thread.start()
+    def _speak_blocking(self, text: str, model_path: str, pitch_cents: int = 0) -> None:
+        """
+        Blocking speak of a single sentence.
+        Called only by the worker thread to guarantee serialization.
+        """
+        self.set_error("")
+
+        sample_rate = self._validate_runtime(model_path, pitch_cents)
+
+        # Piper: raw PCM -> stdout
+        piper_cmd = [
+            self.piper_bin,
+            "--model", model_path,
+            "--length-scale", "1.0",
+            "--output-raw",
+        ]
+        p1 = _spawn_with_logger(
+            piper_cmd,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+
+        # Optional SoX pitch stage
+        pcm_source = p1.stdout
+        p2 = None
+        if pitch_cents != 0:
+            sox_cmd = [
+                "sox",
+                "-t", "raw",
+                "-r", str(sample_rate),
+                "-e", "signed",
+                "-b", "16",
+                "-c", "1",
+                "-L",
+                "-",
+                "-t", "raw",
+                "-",
+                "pitch", str(int(pitch_cents)),
+            ]
+            p2 = _spawn_with_logger(
+                sox_cmd,
+                stdin=p1.stdout,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            pcm_source = p2.stdout
+
+        # aplay sink
+        aplay_cmd = [
+            "aplay",
+            "-r", str(sample_rate),
+            "-f", "S16_LE",
+            "-t", "raw",
+            "-",
+        ]
+        p3 = _spawn_with_logger(
+            aplay_cmd,
+            stdin=pcm_source,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+
+        with self._lock:
+            self._procs = [p for p in (p1, p2, p3) if p is not None]
+            self._aplay_proc = p3
+
+        # Feed Piper (newline helps)
+        if p1.stdin:
+            try:
+                payload = (text.strip() + "\n").encode("utf-8")
+                p1.stdin.write(payload)
+            finally:
+                try:
+                    p1.stdin.close()
+                except Exception:
+                    pass
+
+        # Wait for aplay or stop request
+        try:
+            while True:
+                if self._stop_event.is_set():
+                    break
+                rc = p3.poll()
+                if rc is not None:
+                    break
+                time.sleep(0.03)
+        finally:
+            with self._lock:
+                for p in self._procs:
+                    try:
+                        if p and p.poll() is None:
+                            p.kill()
+                    except Exception:
+                        pass
+                self._procs.clear()
+                self._aplay_proc = None
 
 
 class OllamaInterface:
@@ -335,7 +457,7 @@ class OllamaInterface:
         self.piper = PiperSpeaker()
         self.speech_enabled = tk.BooleanVar(value=False)
         self.voice_var = tk.StringVar(value="Male (Joe)")
-        self.timbre_var = tk.StringVar(value="Tenor (+350¢)")  # default tenor
+        self.timbre_var = tk.StringVar(value="Tenor (+350¢)")
         self.piper_model_var = tk.StringVar(value=VOICE_MODELS.get("Male (Joe)", ""))
 
         self.layout = LayoutManager(self)
@@ -418,6 +540,9 @@ class OllamaInterface:
             f" - Piper binary: {self.piper.piper_bin}\n"
             f" - Voice model: {self.piper_model_var.get()}\n"
             f" - Timbre: {self.timbre_var.get()}\n\n"
+            "Streaming speech behavior:\n"
+            " - Speaks sentence-by-sentence during streaming\n"
+            " - Uses serialized playback worker (no audio collisions)\n\n"
             "Keys:\n"
             " <Enter>: send\n"
             " <Shift+Enter>: new line\n"
@@ -476,7 +601,12 @@ class OllamaInterface:
         self.progress.grid_remove()
 
     def request_stop(self):
+        # stops both LLM streaming AND current/queued speech
         self.stop_event.set()
+        try:
+            self.piper.stop()
+        except Exception:
+            pass
         try:
             self.stop_button.state(["disabled"])
         except Exception:
@@ -605,6 +735,7 @@ class OllamaInterface:
 
     def generate_ai_response(self):
         ai_message = ""
+        stream_buffer = ""  # <-- sentence buffer interception
         try:
             self.ui_sync(self.show_process_bar)
             self.ui(self.prepare_new_request)
@@ -617,12 +748,36 @@ class OllamaInterface:
 
             self.ui_sync(lambda: self.layout.create_inner_label(on_right_side=False, msg_index=len(self.chat_history)))
 
+            # Determine voice settings once per request (used for each sentence)
+            self._update_voice_model_from_ui()
+            model_path = self.piper_model_var.get()
+            pitch_cents = self._get_pitch_cents()
+
             for chunk in self.fetch_chat_stream_result():
                 if self.stop_event.is_set():
                     break
+
+                # UI streaming
                 self.ui(self.append_text_to_chat, f"{chunk}", use_label=True)
                 ai_message += chunk
 
+                # Sentence-level buffer interception (stream -> sentences)
+                if self.speech_enabled.get():
+                    stream_buffer += chunk
+
+                    sentences, stream_buffer = _extract_sentences(stream_buffer)
+                    for s in sentences:
+                        self.piper.enqueue_sentence(s, model_path=model_path, pitch_cents=pitch_cents)
+
+                    # Soft flush if model goes on without punctuation
+                    if len(stream_buffer) > _MAX_BUFFER_BEFORE_SOFT_FLUSH:
+                        # flush a safe chunk (not ideal, but avoids long silence)
+                        soft = stream_buffer.strip()
+                        stream_buffer = ""
+                        if soft:
+                            self.piper.enqueue_sentence(soft, model_path=model_path, pitch_cents=pitch_cents)
+
+            # End-of-stream handling
             if self.stop_event.is_set():
                 if ai_message.strip():
                     self.chat_history.append({"role": "assistant", "content": ai_message})
@@ -631,33 +786,28 @@ class OllamaInterface:
                 self.chat_history.append({"role": "assistant", "content": ai_message})
                 self.ui(self.append_text_to_chat, "\n\n")
 
-                def _speak_if_enabled():
-                    try:
-                        if self.speech_enabled.get():
-                            self._update_voice_model_from_ui()
-                            model_path = self.piper_model_var.get()
-                            pitch_cents = self._get_pitch_cents()
-                            self.piper.speak(ai_message, model_path=model_path, pitch_cents=pitch_cents)
+                # Flush remainder fragment at end (if any)
+                if self.speech_enabled.get():
+                    rem = (stream_buffer or "").strip()
+                    if rem:
+                        self.piper.enqueue_sentence(rem, model_path=model_path, pitch_cents=pitch_cents)
 
-                            def _check_speech_error():
-                                err = self.piper.get_last_error(clear=True)
-                                if err:
-                                    messagebox.showerror(
-                                        "Speech Error",
-                                        "Speech failed.\n\n"
-                                        f"{err}\n\n"
-                                        "Common causes:\n"
-                                        " - Piper path wrong\n"
-                                        " - Voice model/.json missing\n"
-                                        " - 'aplay' missing\n"
-                                        " - 'sox' missing (Tenor presets)\n",
-                                        parent=self.root
-                                    )
-                            self.root.after(300, _check_speech_error)
-                    except Exception as e:
-                        messagebox.showerror("Speech Error", str(e), parent=self.root)
-
-                self.ui(_speak_if_enabled)
+                # Check speech worker error (async)
+                def _check_speech_error():
+                    err = self.piper.get_last_error(clear=True)
+                    if err:
+                        messagebox.showerror(
+                            "Speech Error",
+                            "Speech failed.\n\n"
+                            f"{err}\n\n"
+                            "Common causes:\n"
+                            " - Piper path wrong\n"
+                            " - Voice model/.json missing\n"
+                            " - 'aplay' missing\n"
+                            " - 'sox' missing (Tenor presets)\n",
+                            parent=self.root
+                        )
+                self.ui(lambda: self.root.after(350, _check_speech_error))
 
         except Exception:  # noqa
             self.ui(self.append_text_to_chat, "\nAI error!\n\n", ("Error",))
@@ -919,7 +1069,6 @@ class LayoutManager:
         user_input = tk.Text(input_frame, font=(self.interface.default_font, 12), height=4, wrap=tk.WORD)
         user_input.grid(row=0, column=0, sticky="ew", padx=(0, 10))
 
-        # Bind ONLY Return
         user_input.bind("<Return>", self.interface.handle_key_press)
 
         send_button = ttk.Button(input_frame, text="Send", command=self.interface.on_send_button)
