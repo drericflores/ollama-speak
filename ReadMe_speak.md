@@ -27,6 +27,9 @@ A new GUI variant that includes:
 
 > The speech version is a major usability upgrade for long answers and accessibility—users can listen instead of reading.
 
+Updated:  02/10/2026:
+Streaming → sentence speech: The LLM token stream is now intercepted with a sentence-boundary monitor. Incoming chunks are accumulated in a buffer and only complete sentences (ending in . ! ? or newline) are released for TTS, reducing latency without robotic word-by-word audio.    Serialized audio playback: TTS is decoupled from the stream/UI using a thread-safe queue and a single persistent worker thread. Sentences are spoken one-at-a-time, preventing ALSA “device busy” collisions from overlapping aplay/SoX pipelines.  Markdown sanitization: Before enqueueing speech, text is cleaned to remove common Markdown formatting (bold, inline code, fenced blocks, list markers, links) while preserving the readable words so Piper doesn’t pronounce symbols.  Voice JSON caching: Voice .onnx.json metadata (e.g., sample_rate) is loaded once per model and cached in memory to avoid repeated disk I/O during streaming.
+
 ---
 
 ## Requirements
