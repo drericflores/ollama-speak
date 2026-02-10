@@ -1,34 +1,58 @@
-````markdown
 # Ollama GUI + Ollama Speak (Tkinter)
 
-A lightweight, local-first GUI for **Ollama** built with **Python + Tkinter**, plus an enhanced variant that adds **speech output** so you can *hear* model responses instead of only reading them.
+A lightweight, local-first desktop GUI for **Ollama** built with **Python + Tkinter**—plus an enhanced variant (**Ollama Speak**) that adds **offline speech output** so you can *listen* to model responses.
 
-This project is a fork of the original **ollama-gui** by **chyok**, with improvements and an additional speech-enabled GUI.
+This repository is a fork of **ollama-gui** by **chyok**, with usability improvements and a speech-enabled GUI.
+
+---
+
+## Contents
+
+- [Projects in This Fork](#projects-in-this-fork)
+- [Key Update (02/10/2026)](#key-update-02102026)
+- [Requirements](#requirements)
+- [Ollama Setup](#ollama-setup)
+- [Piper Setup (Speech Version)](#piper-setup-speech-version)
+- [Install](#install)
+- [Run](#run)
+- [Using Ollama Speak](#using-ollama-speak)
+- [Troubleshooting](#troubleshooting)
+- [Credits](#credits)
+- [License](#license)
+- [Disclaimer](#disclaimer)
 
 ---
 
 ## Projects in This Fork
 
-### 1) `ollama_gui.py` (Improved GUI)
+### 1) `ollama_gui.py` — Improved GUI
 Enhancements focused on stability and usability:
-- Safer cancel/stop behavior using `threading.Event` (no widget-state hacks)
-- Network timeouts to prevent hanging
+
+- Safer cancel/stop behavior using `threading.Event`
+- Network timeouts to prevent hangs
 - UI thread-safety improvements for background threads
 - Improved menu structure (About dialog + revision metadata)
 - Keyboard behavior improvements (binds `<Return>` only to avoid breaking shortcuts)
 
-### 2) `ollama_speak.py` (New GUI With Speech Output)
-A new GUI variant that includes:
-- **Speech toggle** (Enable/Disable)
-- Speaks the **final assistant response** after completion (not partial streaming)
-- **Stop Speaking** button
-- Piper-based offline speech using `piper` + ALSA `aplay`
-- Optional timbre lift (e.g., “Tenor”) via **SoX pitch shift** for brighter voice output
+### 2) `ollama_speak.py` — GUI With Speech Output
+Adds an offline TTS pipeline (Piper + ALSA) with optional timbre adjustment:
 
-> The speech version is a major usability upgrade for long answers and accessibility—users can listen instead of reading.
+- Speech toggle (Enable/Disable)
+- **Sentence-synchronized speaking during streaming** (see update below)
+- Stop Speaking button
+- Voice selection (e.g., Joe/Amy)
+- Optional timbre lift (e.g., “Tenor”) using **SoX pitch shift**
 
-Updated:  02/10/2026:
-Streaming → sentence speech: The LLM token stream is now intercepted with a sentence-boundary monitor. Incoming chunks are accumulated in a buffer and only complete sentences (ending in . ! ? or newline) are released for TTS, reducing latency without robotic word-by-word audio.    Serialized audio playback: TTS is decoupled from the stream/UI using a thread-safe queue and a single persistent worker thread. Sentences are spoken one-at-a-time, preventing ALSA “device busy” collisions from overlapping aplay/SoX pipelines.  Markdown sanitization: Before enqueueing speech, text is cleaned to remove common Markdown formatting (bold, inline code, fenced blocks, list markers, links) while preserving the readable words so Piper doesn’t pronounce symbols.  Voice JSON caching: Voice .onnx.json metadata (e.g., sample_rate) is loaded once per model and cached in memory to avoid repeated disk I/O during streaming.
+---
+
+## Key Update (02/10/2026)
+
+The speech engine is now designed for natural, low-latency streaming output:
+
+- **Sentence-level buffering:** streaming chunks are collected until a sentence boundary (`.`, `!`, `?`, newline) is detected, then spoken as a complete thought.
+- **Serialized playback:** a single background worker thread consumes a thread-safe queue so audio playback remains sequential (prevents `aplay` device-busy collisions).
+- **Markdown sanitization:** formatting tokens are removed before speech so punctuation/markup is not read aloud.
+- **Voice JSON caching:** model `.onnx.json` metadata (e.g., `sample_rate`) is cached in memory after first load to reduce disk I/O during streaming.
 
 ---
 
@@ -36,14 +60,15 @@ Streaming → sentence speech: The LLM token stream is now intercepted with a se
 
 ### System
 - Linux recommended (Pop!_OS / Ubuntu tested)
-- Ollama installed and running locally
+- **Ollama** installed and running locally
 - Python 3.10+ recommended
 
 ### Python
 - Tkinter (usually included with system Python)
 - No extra Python packages required for the GUI itself
 
-Install Tkinter if missing:
+If Tkinter is missing:
+
 ```bash
 sudo apt update
 sudo apt install python3-tk -y
@@ -56,9 +81,9 @@ sudo apt install python3-tk -y
 * `piper` (offline TTS)
 * `alsa-utils` (provides `aplay`)
 
-**Optional but recommended**
+**Optional (recommended)**
 
-* `sox` (pitch/timbre presets like “Tenor”)
+* `sox` (pitch/timbre presets like Tenor)
 
 Install audio tools:
 
@@ -71,19 +96,19 @@ sudo apt install alsa-utils sox -y
 
 ## Ollama Setup
 
-Ensure Ollama is running:
+Start the server:
 
 ```bash
 ollama serve
 ```
 
-Test:
+Verify it responds:
 
 ```bash
 curl http://127.0.0.1:11434/api/tags
 ```
 
-Download a model (example):
+Pull a model (example):
 
 ```bash
 ollama pull llama3
@@ -97,12 +122,12 @@ You need a Piper binary and at least one voice model.
 
 ### Piper binary
 
-Example:
+Examples:
 
-* `/home/eric/.local/bin/piper` (default in the script)
-* or `piper` available in `$PATH`
+* `/home/eric/.local/bin/piper` (default path in the script)
+* `piper` available in `$PATH`
 
-Check:
+Verify:
 
 ```bash
 command -v piper && piper --version
@@ -110,12 +135,12 @@ command -v piper && piper --version
 
 ### Voice models
 
-This fork expects Piper models like:
+This fork expects voice models like:
 
 * `/opt/piper/voices/en_US-joe-medium.onnx`
 * `/opt/piper/voices/en_US-amy-low.onnx`
 
-Each model must also have its JSON beside it:
+Each model must also have its JSON next to it:
 
 * `en_US-joe-medium.onnx.json`
 * `en_US-amy-low.onnx.json`
@@ -147,18 +172,17 @@ python3 ollama_speak.py
 
 ---
 
-## Using the Speech GUI (`ollama_speak.py`)
+## Using Ollama Speak
 
 1. Enable **Speech**
-2. Choose a Piper voice model (Joe default)
+2. Select a voice (Joe default)
 3. Ask your question
-4. The GUI speaks the **final** assistant response automatically
-5. Use **Stop Speaking** to interrupt audio output
+4. The GUI speaks responses **sentence-by-sentence** during streaming
+5. Use **Stop Speaking** to interrupt current playback and clear queued speech
 
-### Timbre / Tenor Mode
+### Timbre / Tenor Presets
 
-If you enable a tenor/bright preset, SoX pitch shift is used.
-Install SoX if missing:
+Tenor/bright presets use SoX pitch shifting. If you don’t have SoX:
 
 ```bash
 sudo apt install sox -y
@@ -166,26 +190,37 @@ sudo apt install sox -y
 
 ---
 
-## Notes / Troubleshooting
+## Troubleshooting
 
 ### “I hear nothing”
 
-* Verify Ollama returns text normally
+* Confirm Ollama returns text normally in the GUI
+
 * Verify `aplay` exists:
 
   ```bash
   command -v aplay
   ```
-* Verify Piper works:
+
+* Verify Piper runs:
 
   ```bash
   command -v piper && piper --version
   ```
-* Verify voice model + `.json` exist at the expected path
 
-### Wrong voice tone (too deep / bass-heavy)
+* Verify your voice model and `.json` file exist at the configured path
 
-Use a tenor/bright preset (SoX pitch shift) or switch to a different Piper voice model.
+### “ALSA device busy” or garbled audio
+
+The speech GUI uses serialized playback to prevent collisions. If you still see this:
+
+* Ensure no other application is holding the audio device
+* Try stopping speech, then re-enabling it
+
+### Voice sounds too deep / bass-heavy
+
+* Use a tenor/bright preset (SoX pitch shift)
+* Switch to a different Piper voice model
 
 ---
 
@@ -199,16 +234,13 @@ Use a tenor/bright preset (SoX pitch shift) or switch to a different Piper voice
 ## License
 
 This fork follows the upstream license unless you explicitly change it.
-Check the upstream repository and include/retain the original license file.
+Retain the original license file from the upstream repository.
 
 ---
 
 ## Disclaimer
 
-This project is intended for **local use** with user-provided models and resources.
+This project is intended for local use with user-provided models and resources.
 All trademarks and model names belong to their respective owners.
 
-```
-
-::contentReference[oaicite:0]{index=0}
 ```
