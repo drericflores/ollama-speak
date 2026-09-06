@@ -33,6 +33,7 @@ import subprocess
 import threading
 import queue
 import re
+from pathlib import Path
 
 import urllib.parse
 import urllib.request
@@ -58,10 +59,13 @@ __revision_date__ = "February 10, 2026"
 DEFAULT_PIPER_BIN = "/home/eric/.local/bin/piper"  # adjust if your path differs
 FALLBACK_PIPER_BIN = "piper"                       # use from PATH if available
 
-VOICE_MODELS = {
-    "Female (Amy)": "/opt/piper/voices/en_US-amy-low.onnx",
-    "Male (Joe)":   "/opt/piper/voices/en_US-joe-medium.onnx",
-}
+DEFAULT_VOICE_DIRS = (
+    Path.home() / ".local/share/piper/voices",
+    Path("/opt/piper/voices"),
+)
+
+CONFIG_DIR = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "ollama-speak"
+CONFIG_FILE = CONFIG_DIR / "config.json"
 
 # Timbre presets via SoX pitch (cents); 100 cents = 1 semitone
 TIMBRE_PRESETS = {
@@ -87,6 +91,67 @@ _SENTENCE_SPLIT_RE = re.compile(r"""
 # A fallback flush if the model streams a long fragment with no punctuation:
 _MAX_BUFFER_BEFORE_SOFT_FLUSH = 500
 # ------------------------------------------------------------------------
+
+
+def _voice_label(model_path: Path) -> str:
+    """Create a stable, human-readable label from a Piper model filename."""
+    stem = model_path.name.removesuffix(".onnx")
+    match = re.match(r"(?P<locale>[a-z]{2}_[A-Z]{2})-(?P<name>.+)-(?P<quality>x_low|low|medium|high)$", stem)
+    if not match:
+        return stem
+
+    language_names = {
+        "de_DE": "German (Germany)",
+        "en_US": "English (United States)",
+        "es_AR": "Spanish (Argentina)",
+        "es_ES": "Spanish (Spain)",
+        "es_MX": "Spanish (Mexico)",
+        "it_IT": "Italian (Italy)",
+    }
+    locale = match.group("locale")
+    language = language_names.get(locale, locale)
+    voice_name = match.group("name").replace("_", " ").title()
+    quality = match.group("quality").replace("_", "-").title()
+    return f"{language} — {voice_name} [{quality}]"
+
+
+def discover_voice_models() -> Dict[str, str]:
+    """Discover complete Piper model/config pairs in configured voice directories."""
+    directories = []
+    custom_dir = os.environ.get("OLLAMA_SPEAK_VOICE_DIR")
+    if custom_dir:
+        directories.append(Path(custom_dir).expanduser())
+    directories.extend(DEFAULT_VOICE_DIRS)
+
+    voices: Dict[str, str] = {}
+    for directory in directories:
+        if not directory.is_dir():
+            continue
+        for model_path in sorted(directory.glob("*.onnx")):
+            if not Path(str(model_path) + ".json").is_file():
+                continue
+            label = _voice_label(model_path)
+            if label in voices:
+                label = f"{label} — {directory}"
+            voices[label] = str(model_path)
+    return voices
+
+
+def load_settings() -> Dict[str, Any]:
+    try:
+        data = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except (FileNotFoundError, OSError, json.JSONDecodeError):
+        return {}
+
+
+def save_settings(settings: Dict[str, Any]) -> None:
+    """Atomically save non-sensitive application preferences."""
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    temporary = CONFIG_FILE.with_suffix(".tmp")
+    temporary.write_text(json.dumps(settings, indent=2) + "\n", encoding="utf-8")
+    os.chmod(temporary, 0o600)
+    temporary.replace(CONFIG_FILE)
 
 
 def _system_check(root: tk.Tk) -> Optional[str]:
@@ -295,21 +360,19 @@ class PiperSpeaker:
         return cfg
 
     def _validate_runtime(self, model_path: str, pitch_cents: int) -> int:
+        issues = []
         if (not os.path.exists(self.piper_bin)) and (shutil.which(self.piper_bin) is None):
-            raise FileNotFoundError(f"Piper binary not found: {self.piper_bin}")
-
+            issues.append(f"Piper binary not found: {self.piper_bin}")
         if shutil.which("aplay") is None:
-            raise FileNotFoundError(
-                "Missing 'aplay' (ALSA utils). Install:\n  sudo apt install alsa-utils"
-            )
-
+            issues.append("aplay not found (install alsa-utils)")
         if pitch_cents != 0 and shutil.which("sox") is None:
-            raise FileNotFoundError(
-                "Tenor/Bright Tenor requires 'sox'. Install:\n  sudo apt install sox"
-            )
-
-        if not model_path or not os.path.exists(model_path):
-            raise FileNotFoundError(f"Piper voice model not found: {model_path}")
+            issues.append("SoX not found (required for the selected timbre)")
+        if not model_path or not os.path.isfile(model_path):
+            issues.append(f"Piper voice model not found: {model_path or '[none selected]'}")
+        elif not os.path.isfile(model_path + ".json"):
+            issues.append(f"Piper voice configuration not found: {model_path}.json")
+        if issues:
+            raise RuntimeError("Speech requirements are not ready:\n - " + "\n - ".join(issues))
 
         cfg = self._load_voice_json_cached(model_path)
         sample_rate = int(cfg.get("sample_rate", 16000))
@@ -461,7 +524,8 @@ class OllamaInterface:
 
     def __init__(self, root: tk.Tk):
         self.root: tk.Tk = root
-        self.api_url: str = "http://127.0.0.1:11434"
+        self.settings = load_settings()
+        self.api_url: str = str(self.settings.get("ollama_host", "http://127.0.0.1:11434"))
         self.chat_history: List[dict] = []
         self.label_widgets: List[tk.Label] = []
         self.default_font: str = font.nametofont("TkTextFont").actual()["family"]
@@ -472,10 +536,26 @@ class OllamaInterface:
         self.net_timeout: int = 30
 
         self.piper = PiperSpeaker()
+        self.voice_models = discover_voice_models()
         self.speech_enabled = tk.BooleanVar(value=False)
-        self.voice_var = tk.StringVar(value="Male (Joe)")
-        self.timbre_var = tk.StringVar(value="Normal")
-        self.piper_model_var = tk.StringVar(value=VOICE_MODELS.get("Male (Joe)", ""))
+        saved_voice_path = str(self.settings.get("voice_model", ""))
+        saved_voice_label = next(
+            (label for label, path in self.voice_models.items() if path == saved_voice_path),
+            "",
+        )
+        if not saved_voice_label:
+            saved_voice_label = next(
+                (label for label in self.voice_models if "Joe" in label),
+                next(iter(self.voice_models), "No Piper voices found"),
+            )
+        self.voice_var = tk.StringVar(value=saved_voice_label)
+        saved_timbre = str(self.settings.get("timbre", "Normal"))
+        self.timbre_var = tk.StringVar(
+            value=saved_timbre if saved_timbre in TIMBRE_PRESETS else "Normal"
+        )
+        self.piper_model_var = tk.StringVar(
+            value=self.voice_models.get(saved_voice_label, "")
+        )
 
         self.layout = LayoutManager(self)
         self.layout.init_layout()
@@ -521,6 +601,7 @@ class OllamaInterface:
         return result.get("value")
 
     def on_close(self):
+        self.persist_settings()
         self._ui_alive = False
         try:
             self.stop_event.set()
@@ -571,6 +652,18 @@ class OllamaInterface:
 
     def show_about(self):
         self.show_help()
+
+    def persist_settings(self) -> None:
+        settings = {
+            "ollama_host": self.api_url,
+            "model": self.model_select.get() if hasattr(self, "model_select") else "",
+            "voice_model": self.piper_model_var.get(),
+            "timbre": self.timbre_var.get(),
+        }
+        try:
+            save_settings(settings)
+        except OSError as error:
+            sys.stderr.write(f"[Settings] ERROR: {error}\n")
 
     def check_system(self):
         message = _system_check(self.root)
@@ -656,7 +749,10 @@ class OllamaInterface:
         Thread(target=self.update_model_select, daemon=True).start()
 
     def update_host(self):
-        self.api_url = self.host_input.get()
+        host = self.host_input.get().strip()
+        if host:
+            self.api_url = host.rstrip("/")
+            self.persist_settings()
 
     def update_model_select(self):
         try:
@@ -665,7 +761,8 @@ class OllamaInterface:
             def _apply_models():
                 self.model_select["values"] = models
                 if models:
-                    self.model_select.set(models[0])
+                    preferred = str(self.settings.get("model", ""))
+                    self.model_select.set(preferred if preferred in models else models[0])
                     self.send_button.state(["!disabled"])
                 else:
                     self.show_error("You need download a model!")
@@ -694,8 +791,11 @@ class OllamaInterface:
 
     def _update_voice_model_from_ui(self):
         key = (self.voice_var.get() or "").strip()
-        model = VOICE_MODELS.get(key, VOICE_MODELS.get("Male (Joe)", ""))
+        model = self.voice_models.get(key, "")
         self.piper_model_var.set(model)
+
+    def on_model_changed(self, _=None):
+        self.persist_settings()
 
     def _get_pitch_cents(self) -> int:
         return int(TIMBRE_PRESETS.get(self.timbre_var.get(), 0))
@@ -730,12 +830,44 @@ class OllamaInterface:
 
     def on_voice_changed(self, _=None):
         self._update_voice_model_from_ui()
+        self.persist_settings()
         if self.speech_enabled.get():
             self.on_toggle_speech()
 
     def on_timbre_changed(self, _=None):
+        self.persist_settings()
         if self.speech_enabled.get():
             self.on_toggle_speech()
+
+    def test_voice(self):
+        self._update_voice_model_from_ui()
+        model_path = self.piper_model_var.get()
+        if not model_path:
+            messagebox.showerror(
+                "Voice Test", "No complete Piper voice model was discovered.", parent=self.root
+            )
+            return
+
+        locale = Path(model_path).name[:5]
+        samples = {
+            "de_DE": "Die Sprachausgabe von Ollama Speak funktioniert einwandfrei.",
+            "en_US": "Ollama Speak voice testing is operational.",
+            "es_MX": "La síntesis de voz de Ollama Speak funciona correctamente.",
+            "es_ES": "La síntesis de voz de Ollama Speak funciona correctamente.",
+            "it_IT": "La sintesi vocale di Ollama Speak funziona correttamente.",
+        }
+        try:
+            pitch_cents = self._get_pitch_cents()
+            self.piper._validate_runtime(model_path, pitch_cents)
+            self.piper.stop()
+            self.piper.begin_session()
+            self.piper.enqueue_sentence(
+                samples.get(locale, "Ollama Speak voice testing is operational."),
+                model_path=model_path,
+                pitch_cents=pitch_cents,
+            )
+        except Exception as error:
+            messagebox.showerror("Voice Test Failed", str(error), parent=self.root)
 
     def stop_speaking(self):
         try:
@@ -1012,6 +1144,7 @@ class LayoutManager:
 
         model_select = ttk.Combobox(header_frame, state="readonly", width=30)
         model_select.grid(row=0, column=0)
+        model_select.bind("<<ComboboxSelected>>", self.interface.on_model_changed)
 
         settings_button = ttk.Button(header_frame, text="⚙️", command=self.show_model_management_window, width=3)
         settings_button.grid(row=0, column=1, padx=(5, 0))
@@ -1030,15 +1163,11 @@ class LayoutManager:
         voice_select = ttk.Combobox(
             header_frame,
             state="readonly",
-            width=14,
+            width=38,
             textvariable=self.interface.voice_var,
-            values=list(VOICE_MODELS.keys())
+            values=list(self.interface.voice_models.keys())
         )
-        if "Male (Joe)" in VOICE_MODELS:
-            self.interface.voice_var.set("Male (Joe)")
-        elif list(VOICE_MODELS.keys()):
-            self.interface.voice_var.set(list(VOICE_MODELS.keys())[0])
-        voice_select.grid(row=0, column=4, padx=(0, 8), sticky="w")
+        voice_select.grid(row=1, column=0, columnspan=2, padx=(0, 8), pady=(8, 0), sticky="w")
         voice_select.bind("<<ComboboxSelected>>", self.interface.on_voice_changed)
 
         timbre_select = ttk.Combobox(
@@ -1050,16 +1179,19 @@ class LayoutManager:
         )
         if self.interface.timbre_var.get() not in TIMBRE_PRESETS:
             self.interface.timbre_var.set("Normal")
-        timbre_select.grid(row=0, column=5, padx=(0, 8), sticky="w")
+        timbre_select.grid(row=1, column=2, padx=(0, 8), pady=(8, 0), sticky="w")
         timbre_select.bind("<<ComboboxSelected>>", self.interface.on_timbre_changed)
 
         stop_speak_btn = ttk.Button(header_frame, text="Stop Speaking", command=self.interface.stop_speaking)
-        stop_speak_btn.grid(row=0, column=6, padx=(0, 10))
+        stop_speak_btn.grid(row=1, column=3, padx=(0, 10), pady=(8, 0))
 
-        ttk.Label(header_frame, text="Host:").grid(row=0, column=7, padx=(10, 0))
+        test_voice_btn = ttk.Button(header_frame, text="Test Voice", command=self.interface.test_voice)
+        test_voice_btn.grid(row=1, column=4, padx=(0, 10), pady=(8, 0))
+
+        ttk.Label(header_frame, text="Host:").grid(row=1, column=5, padx=(10, 0), pady=(8, 0))
 
         host_input = ttk.Entry(header_frame, width=24)
-        host_input.grid(row=0, column=8, padx=(5, 0))
+        host_input.grid(row=1, column=6, padx=(5, 0), pady=(8, 0))
         host_input.insert(0, self.interface.api_url)
 
         self.interface.model_select = model_select
