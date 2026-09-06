@@ -7,7 +7,7 @@ from pathlib import Path
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-MODULE_PATH = PROJECT_ROOT / "ollama-speak.py"
+MODULE_PATH = PROJECT_ROOT / "ollama_speak.py"
 if not MODULE_PATH.exists():
     MODULE_PATH = PROJECT_ROOT / "upload/ollama-speak.py"
 SPEC = importlib.util.spec_from_file_location("ollama_speak", MODULE_PATH)

@@ -52,8 +52,8 @@ except (ModuleNotFoundError, ImportError):
     )
     sys.exit(0)
 
-__version__ = "1.3.0"
-__revision_date__ = "February 10, 2026"
+__version__ = "1.4.0"
+__revision_date__ = "September 6, 2026"
 
 
 # -------------------- Piper TTS CONFIG --------------------
@@ -738,7 +738,7 @@ class OllamaInterface:
         except (OSError, ValueError, json.JSONDecodeError) as error:
             sample_rate = f"Unavailable ({error})"
         info = (
-            "Project: Ollama GUI (ollama_speak)\n"
+            "Project: Ollama Speak\n"
             f"Version: {__version__}\n"
             f"Revision Date: {__revision_date__}\n\n"
             "Contributors:\n"
@@ -1499,7 +1499,7 @@ class LayoutManager:
 
 def run():
     root = tk.Tk()
-    root.title("Ollama GUI (Speak)")
+    root.title("Ollama Speak")
 
     screen_width = root.winfo_screenwidth()
     screen_height = root.winfo_screenheight()
