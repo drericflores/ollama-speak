@@ -37,6 +37,7 @@ from pathlib import Path
 
 import urllib.parse
 import urllib.request
+import urllib.error
 
 from threading import Thread, Event
 from typing import Optional, List, Generator, Callable, Any, Dict, Tuple
@@ -152,6 +153,90 @@ def save_settings(settings: Dict[str, Any]) -> None:
     temporary.write_text(json.dumps(settings, indent=2) + "\n", encoding="utf-8")
     os.chmod(temporary, 0o600)
     temporary.replace(CONFIG_FILE)
+
+
+def filter_chat_models(payload: Any) -> List[str]:
+    """Return only Ollama models that can perform completion/chat."""
+    if not isinstance(payload, dict):
+        raise ValueError("Ollama model response must be a JSON object")
+    raw_models = payload.get("models", [])
+    if not isinstance(raw_models, list):
+        raise ValueError("Ollama model response contains an invalid models list")
+
+    models = []
+    for model in raw_models:
+        if not isinstance(model, dict):
+            raise ValueError("Ollama model response contains an invalid model entry")
+        capabilities = model.get("capabilities")
+        if capabilities is not None and not isinstance(capabilities, list):
+            raise ValueError("Ollama model capabilities must be a list")
+        if capabilities and "completion" not in capabilities:
+            continue
+        name = model.get("name")
+        if isinstance(name, str) and name.strip():
+            models.append(name)
+    return models
+
+
+def parse_chat_stream_line(line: bytes, line_number: int) -> Optional[str]:
+    """Validate one newline-delimited Ollama streaming response."""
+    if not line.strip():
+        return None
+    try:
+        payload = json.loads(line.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ValueError(f"Invalid Ollama stream data at line {line_number}: {error}") from error
+    if not isinstance(payload, dict):
+        raise ValueError(f"Invalid Ollama stream object at line {line_number}")
+    if payload.get("error"):
+        raise RuntimeError(f"Ollama reported an error: {payload['error']}")
+    message = payload.get("message")
+    if message is None:
+        return None
+    if not isinstance(message, dict) or not isinstance(message.get("content"), str):
+        raise ValueError(f"Invalid Ollama message at line {line_number}")
+    return message["content"]
+
+
+def validate_chat_history(history: Any) -> List[dict]:
+    """Validate untrusted conversation JSON before using it in the GUI or API."""
+    if not isinstance(history, list):
+        raise ValueError("Conversation must contain a JSON list")
+    if len(history) > 10000:
+        raise ValueError("Conversation contains too many messages")
+
+    validated = []
+    allowed_roles = {"system", "user", "assistant"}
+    total_characters = 0
+    for index, item in enumerate(history, start=1):
+        if not isinstance(item, dict):
+            raise ValueError(f"Conversation entry {index} is not an object")
+        role = item.get("role")
+        content = item.get("content")
+        if role not in allowed_roles:
+            raise ValueError(f"Conversation entry {index} has an invalid role")
+        if not isinstance(content, str):
+            raise ValueError(f"Conversation entry {index} has non-text content")
+        total_characters += len(content)
+        if total_characters > 10_000_000:
+            raise ValueError("Conversation text exceeds the 10 MB safety limit")
+        validated.append({"role": role, "content": content})
+    return validated
+
+
+def describe_network_error(error: Exception) -> str:
+    """Preserve useful HTTP and connection diagnostics for users and logs."""
+    if isinstance(error, urllib.error.HTTPError):
+        detail = ""
+        try:
+            detail = error.read().decode("utf-8", errors="replace").strip()
+        except OSError:
+            pass
+        suffix = f": {detail}" if detail else ""
+        return f"HTTP {error.code} {error.reason}{suffix}"
+    if isinstance(error, urllib.error.URLError):
+        return f"Connection failed: {error.reason}"
+    return str(error) or error.__class__.__name__
 
 
 def _system_check(root: tk.Tk) -> Optional[str]:
@@ -793,8 +878,10 @@ class OllamaInterface:
 
             self.ui(_apply_models)
 
-        except Exception:  # noqa
-            self.ui(self.show_error, "Error! Please check the host.")
+        except (OSError, ValueError, json.JSONDecodeError) as error:
+            detail = describe_network_error(error)
+            sys.stderr.write(f"[Ollama models] ERROR: {detail}\n")
+            self.ui(self.show_error, f"Model refresh failed: {detail}")
         finally:
             self.ui(lambda: self.refresh_button.state(["!disabled"]))
 
@@ -810,8 +897,10 @@ class OllamaInterface:
 
             self.ui(_populate)
 
-        except Exception:  # noqa
-            self.ui(self.append_log_to_inner_textbox, "Error! Please check the Ollama host.")
+        except (OSError, ValueError, json.JSONDecodeError) as error:
+            detail = describe_network_error(error)
+            sys.stderr.write(f"[Ollama models] ERROR: {detail}\n")
+            self.ui(self.append_log_to_inner_textbox, f"Model refresh failed: {detail}")
 
     def _update_voice_model_from_ui(self):
         key = (self.voice_var.get() or "").strip()
@@ -999,8 +1088,10 @@ class OllamaInterface:
                         )
                 self.ui(lambda: self.root.after(350, _check_speech_error))
 
-        except Exception as e:
-            self.ui(self.append_text_to_chat, f"\nAI error: {e}\n\n", ("Error",))
+        except (OSError, ValueError, RuntimeError, json.JSONDecodeError) as error:
+            detail = describe_network_error(error)
+            sys.stderr.write(f"[Ollama chat] ERROR: {detail}\n")
+            self.ui(self.append_text_to_chat, f"\nAI error: {detail}\n\n", ("Error",))
         finally:
             def _finish_request():
                 self._request_active = False
@@ -1015,16 +1106,7 @@ class OllamaInterface:
             urllib.parse.urljoin(self.api_url, "/api/tags"),
             timeout=self.net_timeout,
         ) as response:
-            data = json.load(response)
-            models = []
-            for model in data.get("models", []):
-                capabilities = model.get("capabilities")
-                if capabilities and "completion" not in capabilities:
-                    continue
-                name = model.get("name")
-                if name:
-                    models.append(name)
-            return models
+            return filter_chat_models(json.load(response))
 
     def fetch_chat_stream_result(
         self, model_name: str, messages: List[dict]
@@ -1042,12 +1124,12 @@ class OllamaInterface:
             method="POST",
         )
         with urllib.request.urlopen(request, timeout=self.net_timeout) as resp:
-            for line in resp:
+            for line_number, line in enumerate(resp, start=1):
                 if self.stop_event.is_set():
                     break
-                data = json.loads(line.decode("utf-8"))
-                if "message" in data:
-                    yield data["message"]["content"]
+                content = parse_chat_stream_line(line, line_number)
+                if content is not None:
+                    yield content
 
     def delete_model(self, model_name: str):
         self.ui(self.append_log_to_inner_textbox, clear=True)
@@ -1123,8 +1205,21 @@ class OllamaInterface:
             title="Save Chat As",
         )
         if filepath:
-            with open(filepath, "w", encoding="utf-8") as f:
-                json.dump(self.chat_history, f, indent=2)
+            target = Path(filepath)
+            temporary = target.with_name(target.name + ".tmp")
+            try:
+                temporary.write_text(
+                    json.dumps(self.chat_history, indent=2) + "\n", encoding="utf-8"
+                )
+                temporary.replace(target)
+            except (OSError, TypeError, ValueError) as error:
+                try:
+                    temporary.unlink(missing_ok=True)
+                except OSError:
+                    pass
+                messagebox.showerror(
+                    "Save Conversation Failed", str(error), parent=self.root
+                )
 
     def load_chat(self):
         filepath = filedialog.askopenfilename(
@@ -1133,21 +1228,27 @@ class OllamaInterface:
         )
         if not filepath:
             return
-        with open(filepath, "r", encoding="utf-8") as f:
-            history = json.load(f)
-            if isinstance(history, list) and all("role" in item and "content" in item for item in history):
-                self.clear_chat()
-                self.chat_history = history
-                for idx, message in enumerate(self.chat_history):
-                    if message["role"] != "user":
-                        self.append_text_to_chat(f"{self.model_select.get()}\n", ("Bold",))
-                        self.layout.create_inner_label(on_right_side=False, msg_index=idx)
-                    else:
-                        self.layout.create_inner_label(on_right_side=True, msg_index=idx)
-                    self.append_text_to_chat(message["content"], use_label=True)
-                    self.append_text_to_chat("\n\n")
+        try:
+            path = Path(filepath)
+            if path.stat().st_size > 20_000_000:
+                raise ValueError("Conversation file exceeds the 20 MB safety limit")
+            history = validate_chat_history(json.loads(path.read_text(encoding="utf-8")))
+        except (OSError, UnicodeError, ValueError, json.JSONDecodeError) as error:
+            messagebox.showerror(
+                "Load Conversation Failed", str(error), parent=self.root
+            )
+            return
+
+        self.clear_chat()
+        self.chat_history = history
+        for idx, message in enumerate(self.chat_history):
+            if message["role"] != "user":
+                self.append_text_to_chat(f"{self.model_select.get()}\n", ("Bold",))
+                self.layout.create_inner_label(on_right_side=False, msg_index=idx)
             else:
-                messagebox.showerror("Error", "Invalid chat file format.", parent=self.root)
+                self.layout.create_inner_label(on_right_side=True, msg_index=idx)
+            self.append_text_to_chat(message["content"], use_label=True)
+            self.append_text_to_chat("\n\n")
 
 
 class LayoutManager:
