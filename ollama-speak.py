@@ -208,10 +208,11 @@ class PiperSpeaker:
         self._procs: List[subprocess.Popen] = []
         self._aplay_proc: Optional[subprocess.Popen] = None
         self._stop_event = threading.Event()
+        self._shutdown_event = threading.Event()
         self._last_error: str = ""
 
         # Sentence queue + worker (serialized consumer)
-        self._queue: "queue.Queue[Tuple[str, str, int]]" = queue.Queue()
+        self._queue: "queue.Queue[Optional[Tuple[str, str, int]]]" = queue.Queue()
         self._worker = threading.Thread(target=self._worker_loop, daemon=True)
         self._worker.start()
 
@@ -256,6 +257,18 @@ class PiperSpeaker:
                     pass
             self._procs.clear()
             self._aplay_proc = None
+
+    def begin_session(self) -> None:
+        """Allow speech to resume after a previous Stop operation."""
+        self._stop_event.clear()
+
+    def shutdown(self) -> None:
+        """Stop playback and terminate the speech worker cleanly."""
+        self.stop()
+        self._shutdown_event.set()
+        self._queue.put(None)
+        if self._worker.is_alive() and threading.current_thread() is not self._worker:
+            self._worker.join(timeout=2.0)
 
     @staticmethod
     def _sanitize_text_basic(text: str) -> str:
@@ -318,9 +331,12 @@ class PiperSpeaker:
         self._queue.put((t, model_path, int(pitch_cents)))
 
     def _worker_loop(self) -> None:
-        while True:
+        while not self._shutdown_event.is_set():
             try:
-                text, model_path, pitch_cents = self._queue.get()
+                item = self._queue.get()
+                if item is None:
+                    break
+                text, model_path, pitch_cents = item
                 # If stop was requested, drop items until cleared and reset stop flag
                 if self._stop_event.is_set():
                     self._stop_event.clear()
@@ -451,13 +467,14 @@ class OllamaInterface:
         self.default_font: str = font.nametofont("TkTextFont").actual()["family"]
 
         self._ui_alive: bool = True
+        self._request_active: bool = False
         self.stop_event: Event = Event()
         self.net_timeout: int = 30
 
         self.piper = PiperSpeaker()
         self.speech_enabled = tk.BooleanVar(value=False)
         self.voice_var = tk.StringVar(value="Male (Joe)")
-        self.timbre_var = tk.StringVar(value="Tenor (+350¢)")
+        self.timbre_var = tk.StringVar(value="Normal")
         self.piper_model_var = tk.StringVar(value=VOICE_MODELS.get("Male (Joe)", ""))
 
         self.layout = LayoutManager(self)
@@ -493,9 +510,11 @@ class OllamaInterface:
 
         try:
             self.root.after(0, _runner)
-            done.wait()
         except Exception:
             return None
+
+        if not done.wait(timeout=5.0):
+            raise RuntimeError("Timed out waiting for the Tkinter main thread")
 
         if "error" in result:
             raise result["error"]
@@ -508,7 +527,7 @@ class OllamaInterface:
         except Exception:
             pass
         try:
-            self.piper.stop()
+            self.piper.shutdown()
         except Exception:
             pass
         try:
@@ -526,7 +545,7 @@ class OllamaInterface:
 
     @staticmethod
     def open_homepage():
-        webbrowser.open("https://github.com/chyok/ollama-gui")
+        webbrowser.open("https://github.com/drericflores/ollama-speak")
 
     def show_help(self):
         info = (
@@ -614,6 +633,7 @@ class OllamaInterface:
 
     def prepare_new_request(self):
         self.stop_event.clear()
+        self.piper.begin_session()
         try:
             self.stop_button.state(["!disabled"])
         except Exception:
@@ -724,36 +744,50 @@ class OllamaInterface:
             pass
 
     def on_send_button(self, _=None):
+        if self._request_active:
+            return
         message = self.user_input.get("1.0", "end-1c")
         if message:
+            self._request_active = True
+            self.prepare_new_request()
+            self.send_button.state(["disabled"])
+            self.refresh_button.state(["disabled"])
+
+            model_name = self.model_select.get()
+            speech_enabled = bool(self.speech_enabled.get())
+            self._update_voice_model_from_ui()
+            model_path = self.piper_model_var.get()
+            pitch_cents = self._get_pitch_cents()
+
             self.layout.create_inner_label(on_right_side=True, msg_index=len(self.chat_history))
             self.append_text_to_chat(f"{message}", use_label=True)
             self.append_text_to_chat("\n\n")
             self.user_input.delete("1.0", "end")
             self.chat_history.append({"role": "user", "content": message})
-            Thread(target=self.generate_ai_response, daemon=True).start()
+            history_snapshot = [dict(item) for item in self.chat_history]
+            Thread(
+                target=self.generate_ai_response,
+                args=(model_name, history_snapshot, speech_enabled, model_path, pitch_cents),
+                daemon=True,
+            ).start()
 
-    def generate_ai_response(self):
+    def generate_ai_response(
+        self,
+        model_name: str,
+        history_snapshot: List[dict],
+        speech_enabled: bool,
+        model_path: str,
+        pitch_cents: int,
+    ):
         ai_message = ""
         stream_buffer = ""  # <-- sentence buffer interception
         try:
             self.ui_sync(self.show_process_bar)
-            self.ui(self.prepare_new_request)
-
-            self.ui(lambda: self.send_button.state(["disabled"]))
-            self.ui(lambda: self.refresh_button.state(["disabled"]))
-
-            model_name = self.model_select.get()
             self.ui(self.append_text_to_chat, f"{model_name}\n", ("Bold",))
 
             self.ui_sync(lambda: self.layout.create_inner_label(on_right_side=False, msg_index=len(self.chat_history)))
 
-            # Determine voice settings once per request (used for each sentence)
-            self._update_voice_model_from_ui()
-            model_path = self.piper_model_var.get()
-            pitch_cents = self._get_pitch_cents()
-
-            for chunk in self.fetch_chat_stream_result():
+            for chunk in self.fetch_chat_stream_result(model_name, history_snapshot):
                 if self.stop_event.is_set():
                     break
 
@@ -762,7 +796,7 @@ class OllamaInterface:
                 ai_message += chunk
 
                 # Sentence-level buffer interception (stream -> sentences)
-                if self.speech_enabled.get():
+                if speech_enabled:
                     stream_buffer += chunk
 
                     sentences, stream_buffer = _extract_sentences(stream_buffer)
@@ -787,7 +821,7 @@ class OllamaInterface:
                 self.ui(self.append_text_to_chat, "\n\n")
 
                 # Flush remainder fragment at end (if any)
-                if self.speech_enabled.get():
+                if speech_enabled:
                     rem = (stream_buffer or "").strip()
                     if rem:
                         self.piper.enqueue_sentence(rem, model_path=model_path, pitch_cents=pitch_cents)
@@ -809,13 +843,16 @@ class OllamaInterface:
                         )
                 self.ui(lambda: self.root.after(350, _check_speech_error))
 
-        except Exception:  # noqa
-            self.ui(self.append_text_to_chat, "\nAI error!\n\n", ("Error",))
+        except Exception as e:
+            self.ui(self.append_text_to_chat, f"\nAI error: {e}\n\n", ("Error",))
         finally:
-            self.ui(self.hide_process_bar)
-            self.ui(lambda: self.send_button.state(["!disabled"]))
-            self.ui(lambda: self.refresh_button.state(["!disabled"]))
-            self.ui(lambda: self.stop_button.state(["!disabled"]))
+            def _finish_request():
+                self._request_active = False
+                self.hide_process_bar()
+                self.send_button.state(["!disabled"])
+                self.refresh_button.state(["!disabled"])
+                self.stop_button.state(["!disabled"])
+            self.ui(_finish_request)
 
     def fetch_models(self) -> List[str]:
         with urllib.request.urlopen(
@@ -823,15 +860,25 @@ class OllamaInterface:
             timeout=self.net_timeout,
         ) as response:
             data = json.load(response)
-            return [model["name"] for model in data.get("models", [])]
+            models = []
+            for model in data.get("models", []):
+                capabilities = model.get("capabilities")
+                if capabilities and "completion" not in capabilities:
+                    continue
+                name = model.get("name")
+                if name:
+                    models.append(name)
+            return models
 
-    def fetch_chat_stream_result(self) -> Generator:
+    def fetch_chat_stream_result(
+        self, model_name: str, messages: List[dict]
+    ) -> Generator[str, None, None]:
         request = urllib.request.Request(
             urllib.parse.urljoin(self.api_url, "/api/chat"),
             data=json.dumps(
                 {
-                    "model": self.model_select.get(),
-                    "messages": self.chat_history,
+                    "model": model_name,
+                    "messages": messages,
                     "stream": True,
                 }
             ).encode("utf-8"),
@@ -844,7 +891,6 @@ class OllamaInterface:
                     break
                 data = json.loads(line.decode("utf-8"))
                 if "message" in data:
-                    time.sleep(0.01)
                     yield data["message"]["content"]
 
     def delete_model(self, model_name: str):
@@ -1003,7 +1049,7 @@ class LayoutManager:
             values=list(TIMBRE_PRESETS.keys())
         )
         if self.interface.timbre_var.get() not in TIMBRE_PRESETS:
-            self.interface.timbre_var.set("Tenor (+350¢)")
+            self.interface.timbre_var.set("Normal")
         timbre_select.grid(row=0, column=5, padx=(0, 8), sticky="w")
         timbre_select.bind("<<ComboboxSelected>>", self.interface.on_timbre_changed)
 
@@ -1084,7 +1130,7 @@ class LayoutManager:
         file_menu.add_command(label="Load Chat", command=self.interface.load_chat)
         file_menu.add_separator()
         file_menu.add_command(label="Model Management", command=self.show_model_management_window)
-        file_menu.add_command(label="Exit", command=self.interface.root.quit)
+        file_menu.add_command(label="Exit", command=self.interface.on_close)
 
         edit_menu = tk.Menu(menubar, tearoff=0)
         menubar.add_cascade(label="Edit", menu=edit_menu)
