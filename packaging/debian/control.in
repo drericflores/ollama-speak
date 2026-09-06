@@ -11,4 +11,3 @@ Description: Local Ollama chat client with offline multilingual speech
  Ollama Speak is a Tk desktop client for local Ollama models. It supports
  streaming conversations and optional multilingual speech through separately
  installed Piper voices. Piper, Ollama, and voice models are not bundled.
-
