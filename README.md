@@ -1,137 +1,105 @@
-# Ollama-GUI (Enhanced Fork)
+# Ollama Speak
 
-![GitHub License](https://img.shields.io/github/license/chyok/ollama-gui)
-![Python Version](https://img.shields.io/badge/python-3.10%2B-blue)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![Python](https://img.shields.io/badge/python-3.10%2B-blue.svg)](pyproject.toml)
 
-A lightweight, local-first **Ollama GUI** built with **Python + Tkinter**, based on the
-original work by **chyok**, with stability improvements and an additional
-speech-enabled interface.
+Ollama Speak is a local-first Linux desktop client for Ollama with multilingual
+offline speech powered by Piper. It provides a lightweight Tk interface,
+streaming chat, conversation management, completion-model filtering, and
+sentence-synchronized speech without cloud TTS.
 
-This fork preserves the original philosophy:
-> **Simple, dependency-minimal, local GUI for Ollama**
+The maintained application is `ollama_speak.py`. Earlier implementations are
+preserved under [`legacy/`](legacy/) for attribution and historical reference,
+but are not installed by the Python package.
 
-while extending it in two directions:
-- **ollama-gui-enhanced** — stability & usability improvements
-- **ollama-speak** — a new GUI that can *read responses aloud*
+## Features
 
----
+- Discovers chat/completion models and excludes embedding-only models
+- Streams responses while keeping Tk updates on the GUI thread
+- Stops generation and queued speech cleanly
+- Discovers complete Piper `.onnx` and `.onnx.json` voice pairs
+- Supports multilingual installed Piper voices
+- Reads the correct sample rate from each voice configuration
+- Provides Normal, Tenor, and Bright Tenor timbre presets
+- Persists host, model, voice, and timbre in a mode-`0600` settings file
+- Uses only the Python standard library at runtime
 
-## 📦 Projects in This Fork
+## Runtime components
 
-### 1️⃣ ollama-gui-enhanced (Text-only GUI)
-An improved version of the original `ollama_gui.py`, focused on correctness,
-responsiveness, and usability — **no speech, no extra dependencies**.
+| Component | Purpose | Requirement |
+|---|---|---|
+| Python 3.10+ and Tk | Application and desktop interface | Required |
+| Ollama | Model discovery and chat generation | Required |
+| Piper | Offline speech synthesis | Required for speech |
+| `aplay` (`alsa-utils`) | ALSA playback | Required for speech |
+| SoX | Timbre/pitch processing | Required only for Tenor presets |
+| Piper voice pair | Voice model and metadata | Required for speech |
 
-**Enhancements include:**
-- Proper stop/cancel handling using thread-safe cancellation
-- Network timeouts to prevent GUI lockups
-- Tkinter UI thread-safety fixes
-- Keyboard shortcut preservation (`<Return>` only, no key hijacking)
-- Revised About menu with version and contributor metadata
+The wheel intentionally does not bundle Ollama, Piper, audio tools, or voices.
 
-This version is ideal if you want a **clean, minimal, text-based Ollama GUI**.
+## Quick start
 
----
-
-### 2️⃣ ollama-speak (Speech-Enabled GUI)
-A new GUI variant that adds **offline speech output**, allowing users to **hear**
-model responses instead of reading them.
-
-**Key features:**
-- Enable / Disable speech toggle
-- Speaks the **final assistant response** (not partial streams)
-- Stop Speaking button
-- Uses **Piper TTS** (offline, local, no cloud)
-- Optional timbre adjustment (e.g. tenor/bright voice via SoX)
-
-This version is especially useful for:
-- Long responses
-- Accessibility
-- Hands-free interaction
-- Audio-first workflows
-
----
-
-## 🚀 Original Features (Preserved)
-
-From the upstream project by **chyok**:
-
-- 📁 One-file Tkinter application
-- 📦 No external GUI dependencies
-- 🔍 Automatic Ollama model discovery
-- 🌐 Custom Ollama host support
-- 💬 Multiple conversations
-- 📋 Menu bar and right-click menu
-- 🛑 Stop generation at any time
-- 🗂️ Model download & delete
-- 💾 Save / Load conversation history
-- 📝 Editable conversation bubbles
-
----
-
-## ⚙️ Requirements
-
-### General
-- Python **3.10+**
-- Ollama running locally
+On Pop!_OS or Ubuntu:
 
 ```bash
-ollama serve
-````
-
-### Tkinter (if missing)
-
-```bash
-sudo apt install python3-tk
+sudo apt update
+sudo apt install --yes python3-tk alsa-utils sox pipx
+pipx install piper-tts
 ```
 
-### Speech GUI Only (`ollama-speak`)
-
-* `piper` (offline TTS)
-* `alsa-utils` (`aplay`)
-* Optional: `sox` for pitch/timbre control
+Build and install Ollama Speak:
 
 ```bash
-sudo apt install alsa-utils sox
+mkdir -p build/wheels
+python3 -m pip wheel --no-deps --no-build-isolation \
+  --wheel-dir build/wheels .
+pipx install --force build/wheels/ollama_speak-1.4.0-py3-none-any.whl
+ollama-speak
 ```
 
----
+See [INSTALL.md](INSTALL.md) for Ollama verification, voice downloads, custom
+voice directories, troubleshooting, and removal.
 
-## ▶️ Run
-
-### Text-only enhanced GUI
+## Development qualification
 
 ```bash
-python3 ollama_gui.py
+python3 -m py_compile ollama_speak.py tests/test_ollama_speak.py
+python3 -m unittest discover -s tests -v
+python3 -m pip wheel --no-deps --no-build-isolation \
+  --wheel-dir build/wheels .
 ```
 
-### Speech-enabled GUI
+The wheel contains the maintained module, metadata, console entry point, and
+MIT license. Tests, legacy sources, settings, build artifacts, Piper binaries,
+and voices are excluded.
+
+## Configuration
+
+Preferences are stored at:
+
+```text
+${XDG_CONFIG_HOME:-$HOME/.config}/ollama-speak/config.json
+```
+
+Add another voice directory without changing source:
 
 ```bash
-python3 ollama_speak.py
+export OLLAMA_SPEAK_VOICE_DIR=/path/to/piper/voices
+ollama-speak
 ```
 
----
+## Privacy and licensing
 
-## 🧠 Notes
+Chat traffic stays between the application and the configured Ollama host.
+Speech is synthesized locally. Ollama Speak adds no telemetry or cloud service.
 
-* `ollama-speak` **does not replace** the original GUI — it is an **additional option**
-* Speech is local, offline, and user-controlled
-* No telemetry, no cloud APIs, no servers added
+Ollama Speak uses the MIT License. Piper and Piper voice models are separate
+works with their own licenses; review them before redistribution.
 
----
+## Credits
 
-## 👥 Credits
+- Original Ollama GUI project: **chyok**
+- Consolidation, reliability work, and speech integration:
+  **Dr. Eric O. Flores**
 
-* **Original Project:** `ollama-gui` by **chyok**
-* **Enhancements & Speech GUI:** **Dr. Eric O. Flores**
-
----
-
-## 📜 License
-
-MIT License
-Original work © 2024 chyok
-Enhancements © 2026 Dr. Eric O. Flores
-
-See [LICENSE](LICENSE) for details.
+See [LICENSE](LICENSE) for the full license text.
