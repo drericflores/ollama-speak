@@ -359,6 +359,25 @@ class PiperSpeaker:
             self._voice_json_cache[model_path] = cfg
         return cfg
 
+    def get_voice_sample_rate(self, model_path: str) -> int:
+        """Return a validated Piper sample rate from current or legacy metadata."""
+        cfg = self._load_voice_json_cached(model_path)
+        audio = cfg.get("audio")
+        sample_rate = audio.get("sample_rate") if isinstance(audio, dict) else None
+        if sample_rate is None:
+            sample_rate = cfg.get("sample_rate")
+        if sample_rate is None:
+            raise ValueError(f"Voice configuration has no sample rate: {model_path}.json")
+        try:
+            sample_rate = int(sample_rate)
+        except (TypeError, ValueError) as error:
+            raise ValueError(
+                f"Voice configuration has an invalid sample rate: {sample_rate!r}"
+            ) from error
+        if not 8000 <= sample_rate <= 192000:
+            raise ValueError(f"Voice sample rate is outside the supported range: {sample_rate} Hz")
+        return sample_rate
+
     def _validate_runtime(self, model_path: str, pitch_cents: int) -> int:
         issues = []
         if (not os.path.exists(self.piper_bin)) and (shutil.which(self.piper_bin) is None):
@@ -374,9 +393,7 @@ class PiperSpeaker:
         if issues:
             raise RuntimeError("Speech requirements are not ready:\n - " + "\n - ".join(issues))
 
-        cfg = self._load_voice_json_cached(model_path)
-        sample_rate = int(cfg.get("sample_rate", 16000))
-        return sample_rate
+        return self.get_voice_sample_rate(model_path)
 
     def enqueue_sentence(self, text: str, model_path: str, pitch_cents: int = 0) -> None:
         """
@@ -447,6 +464,7 @@ class PiperSpeaker:
                 "-",
                 "-t", "raw",
                 "-",
+                "gain", "-3",
                 "pitch", str(int(pitch_cents)),
             ]
             p2 = _spawn_with_logger(
@@ -629,6 +647,11 @@ class OllamaInterface:
         webbrowser.open("https://github.com/drericflores/ollama-speak")
 
     def show_help(self):
+        voice_model = self.piper_model_var.get()
+        try:
+            sample_rate = f"{self.piper.get_voice_sample_rate(voice_model)} Hz"
+        except (OSError, ValueError, json.JSONDecodeError) as error:
+            sample_rate = f"Unavailable ({error})"
         info = (
             "Project: Ollama GUI (ollama_speak)\n"
             f"Version: {__version__}\n"
@@ -638,7 +661,8 @@ class OllamaInterface:
             " - Dr. Eric O. Flores (Enhancements / Revisions)\n\n"
             "Speech:\n"
             f" - Piper binary: {self.piper.piper_bin}\n"
-            f" - Voice model: {self.piper_model_var.get()}\n"
+            f" - Voice model: {voice_model}\n"
+            f" - Sample rate: {sample_rate}\n"
             f" - Timbre: {self.timbre_var.get()}\n\n"
             "Streaming speech behavior:\n"
             " - Speaks sentence-by-sentence during streaming\n"
