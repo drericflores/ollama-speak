@@ -13,7 +13,7 @@ for command_name in python3 dpkg-deb install sed; do
 done
 
 version=$(python3 -c \
-    'import pathlib,sys,tomllib; print(tomllib.loads(pathlib.Path(sys.argv[1]).read_text())["project"]["version"])' \
+    'import pathlib,re,sys; text=pathlib.Path(sys.argv[1]).read_text(); match=re.search(r"(?m)^version\s*=\s*\"([^\"]+)\"", text); print(match.group(1) if match else "")' \
     "$project_root/pyproject.toml" 2>/dev/null) || {
         printf 'Unable to read the project version from pyproject.toml\n' >&2
         exit 1

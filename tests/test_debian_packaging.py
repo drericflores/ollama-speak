@@ -31,6 +31,7 @@ class DebianPackagingTests(unittest.TestCase):
         self.assertIn("set -eu", script)
         self.assertIn("mktemp -d", script)
         self.assertIn("dpkg-deb --root-owner-group --build", script)
+        self.assertNotIn("tomllib", script)
         for destination in (
             "usr/bin/ollama-speak",
             "usr/lib/python3/dist-packages/ollama_speak.py",
