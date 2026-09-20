@@ -103,3 +103,5 @@ works with their own licenses; review them before redistribution.
   **Dr. Eric O. Flores**
 
 See [LICENSE](LICENSE) for the full license text.
+
+If you enjoy this application and would like to support its development, donations are welcome via Zelle to eoftoro@gmail.com.
